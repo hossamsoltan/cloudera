@@ -1,0 +1,14 @@
+utility1.example.com,192.168.1.201
+utility2.example.com,192.168.1.202
+worker1.example.com,192.168.1.231
+worker2.example.com,192.168.1.232
+worker3.example.com,192.168.1.233
+master1.example.com,192.168.1.221
+master2.example.com,192.168.1.222
+master3.example.com,192.168.1.223
+gateway1.example.com,192.168.1.211
+gateway2.example.com,192.168.1.212
+kts1.example.com,192.168.1.225
+kts2.example.com,192.168.1.226
+kms1.example.com,192.168.1.227
+kms2.example.com,192.168.1.228
