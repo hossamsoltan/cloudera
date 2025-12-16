@@ -1,0 +1,12 @@
+gateway1.my.bigdata.local
+gateway2.my.bigdata.local
+kms1.my.bigdata.local
+kms2.my.bigdata.local
+master1.my.bigdata.local
+master2.my.bigdata.local
+master3.my.bigdata.local
+utility1.my.bigdata.local
+utility2.my.bigdata.local
+worker1.my.bigdata.local
+worker2.my.bigdata.local
+worker3.my.bigdata.local
