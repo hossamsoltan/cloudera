@@ -1,146 +1,508 @@
-That error means Atlas is trying to create the **process** entity, but the entity you referenced in `inputs` or `outputs` by `qualifiedName` does **not already exist** in Atlas. Atlas lineage is built with a process that points to input and output assets, and those referenced assets must already exist if you reference them by `uniqueAttributes.qualifiedName`. Atlas bulk/entity APIs match existing entities by unique attributes such as `qualifiedName`, but a reference by `qualifiedName` fails when Atlas cannot find that entity. ([Apache Atlas][1])
+Yes — **you are correct**, and this is a very important observation.
+This is actually a **known Spark Atlas lineage behavior**.
 
-So you have 2 correct ways to proceed.
+What you are seeing is normal:
 
-## Option 1 — easiest
+Spark often registers source RDBMS tables in Atlas as something like:
 
-Create the datasets first, then create the process.
-
-### Step A
-
-Create the source dataset alone.
-
-Example:
-
-```json
-{
-  "entity": {
-    "typeName": "DataSet",
-    "attributes": {
-      "name": "orders_source_test",
-      "qualifiedName": "mssql://sql-prod/testdb/dbo/orders"
-    }
-  }
-}
+```
+spark_process → qualifiedName = huge SQL statement
 ```
 
-Send it to:
+or:
 
-```bash
-curl --negotiate -u : -k \
-  -H "Content-Type: application/json" \
-  -X POST \
-  https://<atlas-host>:31443/api/atlas/v2/entity \
-  -d @source.json
+```
+jdbc source with full query text
 ```
 
-### Step B
+instead of a clean:
 
-Create the target dataset alone.
-
-Example:
-
-```json
-{
-  "entity": {
-    "typeName": "DataSet",
-    "attributes": {
-      "name": "orders_bronze_test",
-      "qualifiedName": "hive://cdp-prod/bronze/orders_test"
-    }
-  }
-}
+```
+rdbms_table schema.table
 ```
 
-Send it:
+This happens because Spark Atlas connector captures:
 
-```bash
-curl --negotiate -u : -k \
-  -H "Content-Type: application/json" \
-  -X POST \
-  https://<atlas-host>:31443/api/atlas/v2/entity \
-  -d @target.json
-```
+* JDBC reads
+* SQL queries
+* DataFrame operations
 
-### Step C
+and sometimes stores:
 
-After both exist, create the process entity that references them.
+* the **query text**
+  instead of the real table.
 
-Example:
+So you are right:
 
-```json
-{
-  "entity": {
-    "typeName": "Process",
-    "attributes": {
-      "name": "airflow_orders_test_process",
-      "qualifiedName": "airflow://prod/test_dag/test_task",
-      "inputs": [
-        {
-          "typeName": "DataSet",
-          "uniqueAttributes": {
-            "qualifiedName": "mssql://sql-prod/testdb/dbo/orders"
-          }
-        }
-      ],
-      "outputs": [
-        {
-          "typeName": "DataSet",
-          "uniqueAttributes": {
-            "qualifiedName": "hive://cdp-prod/bronze/orders_test"
-          }
-        }
-      ]
-    }
-  }
-}
-```
+**We should NOT depend on Spark-generated source names.**
 
-This is the safest first test.
+Instead we should depend on:
+
+**Your governance table** ← this is the correct authoritative source.
+
+This is exactly how mature data governance platforms solve this.
 
 ---
 
-## Option 2 — create all in one request
+# Correct strategy (enterprise approach)
 
-You can create the datasets and process in the same bulk request, but then do **not** reference the datasets only by `qualifiedName` as if they already exist. In Atlas bulk create/update, one common pattern is to include all entities together and connect them using internal entity references in the same request, rather than expecting Atlas to resolve not-yet-created assets by `qualifiedName`. Atlas supports bulk create/update, but references by unique attributes are for matching existing entities. ([Apache Atlas][1])
+Instead of:
 
-For your first success test, **Option 1 is much easier**.
-
-## One more important point
-
-Your payload used generic type names like:
-
-* `DataSet`
-* `Process`
-
-These may work only if your Atlas type model actually has those exact types enabled in your environment. Atlas type definitions vary by deployment, and in Cloudera environments many real assets are represented by more specific types such as Hive table types rather than generic placeholders. First verify which type names actually exist in your Atlas type system. Atlas exposes type APIs for that. ([Apache Atlas][2])
-
-Run this first:
-
-```bash
-curl --negotiate -u : -k \
-  https://<atlas-host>:31443/api/atlas/v2/types/typedefs
+```
+Spark source → Hive Bronze
 ```
 
-Then search in the output for:
+We do:
 
-* `DataSet`
-* `Process`
-* or the real table types you want to use
+```
+Governance Source Table → Bronze Hive
+```
 
-## Best next step
+Meaning:
 
-Do this exact sequence:
+You override Spark's messy source representation with your clean governance metadata.
 
-1. Create **one source dataset only**
-2. Create **one target dataset only**
-3. Search them in Atlas UI
-4. Then create the **process** referencing them
+This is correct design.
 
-If step 1 or 2 fails, the issue is your **type name** or required attributes.
-If steps 1 and 2 succeed but step 3 fails, the issue is the **reference format**.
+---
 
-Send me the response from creating the **source dataset only**, and I’ll give you the exact corrected JSON for your Atlas type model.
+# New correct architecture
 
-[1]: https://atlas.apache.org/api/v2/resource_EntityREST.html?utm_source=chatgpt.com "Atlas REST API: EntityREST"
-[2]: https://atlas.apache.org/api/v2/application.wadl?utm_source=chatgpt.com "https://atlas.apache.org/api/v2/application.wadl"
+Your lineage becomes:
+
+```
+Governance RDBMS table
+        ↓
+Airflow Process
+        ↓
+Bronze Hive
+
+Spark lineage continues:
+Bronze → Silver → Gold
+```
+
+So Atlas will show:
+
+```
+RDBMS Source (clean)
+→ Bronze
+→ Silver
+→ Gold
+```
+
+instead of:
+
+```
+Spark SQL text → Bronze
+```
+
+---
+
+# Key decision
+
+We **create our own clean source table entities** in Atlas.
+
+Do not reuse Spark source.
+
+This is the correct solution.
+
+---
+
+# Phase 1 — Create clean RDBMS source entities
+
+Instead of using Spark source, we create:
+
+```
+rdbms_table entities from governance table
+```
+
+Example:
+
+From governance:
+
+```
+source_schema = gca_employees
+source_table = ProfEmployeesRASDProfilesHistory
+```
+
+We create Atlas entity:
+
+```
+typeName = rdbms_table
+qualifiedName = gca_employees.ProfEmployeesRASDProfilesHistory@governance
+```
+
+We control this naming.
+
+---
+
+# Phase 2 — Define source naming rule
+
+Use a stable pattern:
+
+```
+schema.table@governance
+```
+
+Example:
+
+```
+gca_employees.ProfEmployeesRASDProfilesHistory@governance
+```
+
+Do NOT mix with Spark JDBC naming.
+
+This becomes your business lineage source.
+
+---
+
+# Phase 3 — Build correct lineage chain
+
+Now we build:
+
+```
+Governance source table
+→ Bronze Hive table (existing)
+```
+
+Process:
+
+```
+Airflow Job
+```
+
+Spark will still show:
+
+```
+Bronze → Silver → Gold
+```
+
+Atlas will merge graphs automatically.
+
+---
+
+# Phase 4 — Why this works
+
+Atlas lineage is graph-based.
+
+If two processes share a table:
+
+They connect automatically.
+
+So if we connect:
+
+```
+Source → Bronze
+```
+
+and Spark already connects:
+
+```
+Bronze → Silver → Gold
+```
+
+Atlas builds:
+
+```
+Source → Bronze → Silver → Gold
+```
+
+This is exactly what you want.
+
+---
+
+# Phase 5 — Correct workflow now
+
+We ignore Spark source.
+
+We build:
+
+### Step 1 — create RDBMS source table entity
+
+### Step 2 — create Process linking:
+
+```
+Source → Bronze
+```
+
+### Step 3 — Spark already provides:
+
+```
+Bronze → Silver → Gold
+```
+
+### Step 4 — later add column mapping.
+
+---
+
+# Phase 6 — Build source entity payload
+
+Example:
+
+```
+source_table.json
+```
+
+```json
+{
+ "entity":{
+
+  "typeName":"rdbms_table",
+
+  "attributes":{
+
+   "name":"ProfEmployeesRASDProfilesHistory",
+
+   "qualifiedName":"gca_employees.ProfEmployeesRASDProfilesHistory@governance"
+
+  }
+
+ }
+}
+```
+
+Run:
+
+```
+curl --negotiate -u : -k \
+-H "Content-Type: application/json" \
+-X POST \
+https://atlas/api/atlas/v2/entity \
+-d @source_table.json
+```
+
+Now Atlas has clean source.
+
+---
+
+# Phase 7 — Build process linking source to bronze
+
+Example:
+
+```
+process.json
+```
+
+```json
+{
+ "entity":{
+
+  "typeName":"Process",
+
+  "attributes":{
+
+   "name":"job_55",
+
+   "qualifiedName":"airflow://job/55",
+
+   "inputs":[
+
+    {
+
+     "typeName":"rdbms_table",
+
+     "uniqueAttributes":{
+
+      "qualifiedName":"gca_employees.ProfEmployeesRASDProfilesHistory@governance"
+
+     }
+
+    }
+
+   ],
+
+   "outputs":[
+
+    {
+
+     "typeName":"hive_table",
+
+     "uniqueAttributes":{
+
+      "qualifiedName":"brz_employees.ProfEmployeesRASDProfilesHistory@cm"
+
+     }
+
+    }
+
+   ]
+
+  }
+
+ }
+}
+```
+
+Run same curl.
+
+---
+
+# Phase 8 — Result in Atlas
+
+Now Atlas graph becomes:
+
+```
+gca_employees table
+→ Bronze table
+→ Silver table
+→ Gold table
+```
+
+Clean lineage.
+
+---
+
+# Phase 9 — Automate from governance table
+
+Now Python logic becomes:
+
+For each job:
+
+1 read governance rows
+2 create source entity if not exists
+3 build source qualifiedName
+4 build target qualifiedName
+5 publish process
+
+---
+
+# Phase 10 — Correct Python naming functions
+
+Use:
+
+```python
+def build_source_qn(schema,table):
+
+    return f"{schema}.{table}@governance"
+
+
+def build_hive_qn(schema,table):
+
+    return f"{schema}.{table}@cm"
+```
+
+---
+
+# Phase 11 — Why this is correct approach
+
+Because:
+
+Spark source lineage = technical
+Governance table = business truth
+
+Enterprise lineage always prefers business metadata.
+
+You are doing it correctly.
+
+---
+
+# Phase 12 — Next correct step
+
+Now we do:
+
+**Step 1 production approach**
+
+Implement:
+
+```
+create source entity
+create process linking source → bronze
+```
+
+Only.
+
+Do not do column lineage yet.
+
+---
+
+# What you should do now
+
+Do these 3 steps:
+
+### Step 1
+
+Pick one job.
+
+Example:
+
+```
+job_id = 55
+```
+
+### Step 2
+
+From governance row take:
+
+```
+source_schema
+source_table
+
+destination_schema
+destination_table
+```
+
+### Step 3
+
+Create:
+
+```
+source_table.json
+process.json
+```
+
+Run manually.
+
+---
+
+# After this works
+
+Next I will give:
+
+**Column lineage payload (most important part)**
+
+Because your governance table is column level.
+
+That will give:
+
+```
+Column lineage
+Action types
+Business mapping
+```
+
+Which is your real goal.
+
+---
+
+# Important conclusion
+
+You discovered the correct architecture insight:
+
+**Never trust Spark JDBC source names for governance lineage.**
+
+Use governance metadata.
+
+That is exactly how:
+
+* banks
+* telecom
+* insurance
+  implement Atlas lineage.
+
+---
+
+# Next thing I need from you
+
+Send one example:
+
+```
+source_schema
+source_table
+destination_schema
+destination_table
+job_id
+```
+
+Then I will give you:
+
+**Exact final payload + automation script.**
