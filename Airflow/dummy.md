@@ -1,26 +1,27 @@
 The error is clear:
 
-AttributeError: 'AtlasPublisher' object has no attribute 'publish_table_lineage'
+`AttributeError: 'AtlasPublisher' object has no attribute 'publish_table_lineage'`
 
-Because your new AtlasPublisher class only has:
+Because your new `AtlasPublisher` class only has:
 
-__init__
-
-post_entity
-
+* `__init__`
+* `post_entity`
 
 But your test file is still calling:
 
+```python
 publisher.publish_table_lineage(model)
+```
 
 So you need to do one of these two fixes.
 
-Best fix
+## Best fix
 
-Add publish_table_lineage() back into atlas_publisher.py.
+Add `publish_table_lineage()` back into `atlas_publisher.py`.
 
 Use this full file:
 
+```python
 import subprocess
 import json
 import tempfile
@@ -114,68 +115,65 @@ class AtlasPublisher:
 
         print("Publishing process entity...")
         self.post_entity(process_payload)
-
+```
 
 ---
 
-Why this happened
+## Why this happened
 
 Before, your class had a method named something like:
 
+```python
 publish_table_lineage()
+```
 
 Then you replaced the file with a simpler version that only contains:
 
+```python
 post_entity()
+```
 
 But your test script still expects the old method.
 
 So Python is correct.
 
-
 ---
 
-What to do now
+## What to do now
 
 After saving the full file above, run again:
 
+```bash
 python3 test_publish_one_transition.py
-
-
----
-
-If you want the quick temporary fix
-
-Instead of changing the class, you could change the test script to call post_entity() directly, but this is not good because your script already has a model, and you still need to build:
-
-source payload
-
-target payload
-
-process payload
-
-
-So the clean fix is to keep publish_table_lineage().
-
+```
 
 ---
 
-Important note
+## If you want the quick temporary fix
+
+Instead of changing the class, you could change the test script to call `post_entity()` directly, but this is not good because your script already has a `model`, and you still need to build:
+
+* source payload
+* target payload
+* process payload
+
+So the clean fix is to keep `publish_table_lineage()`.
+
+---
+
+## Important note
 
 Your screenshot also shows this printed model:
 
-source_type = rdbms_table
-
-target_type = hive_table
-
+* `source_type = rdbms_table`
+* `target_type = hive_table`
 
 That part looks good.
 
 So your current blocker is only the missing method, not the lineage model itself.
 
-
 ---
 
-Next step after this works
+## Next step after this works
 
-When this succeeds, Atlas should show the table-level connection. After that we move to column lineage using the rows from public.data_like_governance.
+When this succeeds, Atlas should show the table-level connection. After that we move to column lineage using the rows from `public.data_like_governance`.
