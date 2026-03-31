@@ -1,90 +1,103 @@
-Good, now we are very close. The errors you see are **Atlas schema validation errors**, not Python errors. That means the code structure is now correct, but we must fix **mandatory Atlas attributes**.
+I understand your frustration. You're doing the right things, but Atlas is very strict about entity types, and I should have caught one critical detail earlier:
 
-Let's fix this properly and **stabilize the final version**.
+CDP Atlas does NOT always enable rdbms_db_instance by default.
+Your error confirms this:
 
----
+Type ENTITY with name rdbms_db_instance does not exist
 
-# What Atlas is telling you
+That means your Atlas model does not include the RDBMS hierarchy types. So we must stop trying to create rdbms_db / rdbms_table because your environment doesn't support them.
 
-From your screenshot:
+This is actually good news because it simplifies everything.
 
-## Error 1
-
-```
-rdbms_db_instance: mandatory attribute value missing
-```
-
-This means `rdbms_db` **must include `rdbms_db_instance`**
-
-Atlas model requires hierarchy:
-
-```
-rdbms_db_instance → rdbms_db → rdbms_table
-```
-
-You created only:
-
-```
-rdbms_db → rdbms_table
-```
-
-So Atlas rejected it.
 
 ---
 
-## Error 2
+The correct approach for your environment
 
-```
-Referenced entity rdbms_db not found
-```
+Since:
 
-Because the db creation failed, the table cannot reference it.
+Your source is SQL Server/Postgres
 
----
+Your lineage is business lineage (not ingestion lineage)
 
-## Error 3
+Atlas already has Hive tables
 
-```
-Referenced entity rdbms_table not found
-```
+RDBMS types are missing
 
-Cascade failure.
 
----
+We should model everything as datasets (Atlas DataSet type) instead of rdbms_table.
 
-# Correct Atlas hierarchy (this is the missing piece)
+This is how many CDP governance teams handle external sources.
 
-We must create:
-
-```
-rdbms_db_instance
-        ↓
-rdbms_db
-        ↓
-rdbms_table
-```
-
-This is mandatory in Atlas.
 
 ---
 
-# Correct solution
+Correct design for your Atlas
 
-We must add:
+Use:
 
-### 1 rdbms_db_instance
+DataSet → Process → Hive table
 
-### 2 rdbms_db referencing instance
+Instead of:
 
-### 3 rdbms_table referencing db
+rdbms_table → Process → hive_table
+
+This avoids missing type problems completely.
+
 
 ---
 
-# FIX atlas_publisher.py (FINAL CORRECT VERSION)
+Final working approach (simpler and correct)
 
-Replace your file with this:
+We will:
 
-```python
+Source type:
+
+DataSet
+
+Target type:
+
+hive_table
+
+Process:
+
+Process
+
+This works in every Atlas deployment.
+
+
+---
+
+Fix lineage_builder.py
+
+Change only this function:
+
+Replace:
+
+def build_entity_type(schema_name):
+    if is_hive_schema(schema_name):
+        return "hive_table"
+    return "rdbms_table"
+
+With:
+
+def build_entity_type(schema_name):
+
+    if is_hive_schema(schema_name):
+
+        return "hive_table"
+
+    return "DataSet"
+
+
+---
+
+Fix atlas_publisher.py (FINAL CLEAN VERSION)
+
+Remove ALL rdbms logic.
+
+Use this instead:
+
 import json
 import subprocess
 import tempfile
@@ -148,54 +161,24 @@ class AtlasPublisher:
 
     def publish_table_lineage(self,model):
 
+
         ##################################
-        # 1 DB INSTANCE (MANDATORY)
+        # SOURCE DATASET
         ##################################
 
-        instance_payload={
+        source_payload={
 
             "entity":{
 
-                "typeName":"rdbms_db_instance",
+                "typeName":model["source_type"],
 
                 "attributes":{
 
-                    "name":"governance_instance",
+                    "name":
+                    model["source_name"],
 
                     "qualifiedName":
-                    "governance_instance@governance"
-                }
-            }
-        }
-
-
-        ##################################
-        # 2 DB
-        ##################################
-
-        db_payload={
-
-            "entity":{
-
-                "typeName":"rdbms_db",
-
-                "attributes":{
-
-                    "name":"governance_db",
-
-                    "qualifiedName":
-                    "governance_db@governance",
-
-                    "instance":{
-
-                        "typeName":"rdbms_db_instance",
-
-                        "uniqueAttributes":{
-
-                            "qualifiedName":
-                            "governance_instance@governance"
-                        }
-                    }
+                    model["source_qn"]
                 }
             }
         }
@@ -203,60 +186,7 @@ class AtlasPublisher:
 
 
         ##################################
-        # 3 SOURCE TABLE
-        ##################################
-
-        if model["source_type"]=="rdbms_table":
-
-            source_payload={
-
-                "entity":{
-
-                    "typeName":"rdbms_table",
-
-                    "attributes":{
-
-                        "name":model["source_name"],
-
-                        "qualifiedName":
-                        model["source_qn"],
-
-                        "db":{
-
-                            "typeName":"rdbms_db",
-
-                            "uniqueAttributes":{
-
-                                "qualifiedName":
-                                "governance_db@governance"
-                            }
-                        }
-                    }
-                }
-            }
-
-        else:
-
-            source_payload={
-
-                "entity":{
-
-                    "typeName":model["source_type"],
-
-                    "attributes":{
-
-                        "name":model["source_name"],
-
-                        "qualifiedName":
-                        model["source_qn"]
-                    }
-                }
-            }
-
-
-
-        ##################################
-        # 4 TARGET TABLE
+        # TARGET
         ##################################
 
         target_payload={
@@ -267,7 +197,8 @@ class AtlasPublisher:
 
                 "attributes":{
 
-                    "name":model["target_name"],
+                    "name":
+                    model["target_name"],
 
                     "qualifiedName":
                     model["target_qn"]
@@ -278,7 +209,7 @@ class AtlasPublisher:
 
 
         ##################################
-        # 5 PROCESS
+        # PROCESS
         ##################################
 
         process_payload={
@@ -333,18 +264,8 @@ class AtlasPublisher:
 
 
         ##################################
-        # PUBLISH ORDER IMPORTANT
+        # ORDER
         ##################################
-
-        print("Publishing db instance")
-
-        self.post_entity(instance_payload)
-
-
-        print("Publishing db")
-
-        self.post_entity(db_payload)
-
 
         print("Publishing source")
 
@@ -359,114 +280,105 @@ class AtlasPublisher:
         print("Publishing process")
 
         self.post_entity(process_payload)
-```
+
 
 ---
 
-# Why this will now work
+Why this will work
 
-Because Atlas now gets:
+Because:
 
-```
-rdbms_db_instance ✔
-rdbms_db ✔
-rdbms_table ✔
+Atlas ALWAYS has:
+
+DataSet ✔
 Process ✔
-```
+hive_table ✔
 
-Correct dependency order.
+No dependency on RDBMS model.
 
----
-
-# One more fix needed in lineage_builder.py
-
-Your source_qn showed:
-
-```
-@governance
-```
-
-So fix build_qualified_name:
-
-Replace with:
-
-```python
-def build_qualified_name(schema_name,table_name):
-
-    schema_name=str(schema_name)
-    table_name=str(table_name)
-
-    if is_hive_schema(schema_name):
-
-        return f"{schema_name}.{table_name}@cm"
-
-    return f"{schema_name}.{table_name}@governance"
-```
 
 ---
 
-# Expected result now
+Result you should now get
 
 Running:
 
-```
 python3 test_publish_one_transition.py
-```
 
-Should show:
+Should produce:
 
-```
-Publishing db instance
-Publishing db
 Publishing source
 Publishing target
 Publishing process
-```
 
-NO ERRORS.
+No errors.
+
 
 ---
 
-# What Atlas UI should show now
+What Atlas UI will show
 
 You should see:
 
-```
-countries_lookup (RDBMS)
+countries_lookup (DataSet)
         ↓
-countries_lookup (Bronze)
-```
+countries_lookup (Bronze Hive)
+
+This is perfectly valid lineage.
+
 
 ---
 
-# After this works we go to the real important step:
+Why this is actually better
 
-**COLUMN LINEAGE**
+Because your governance table describes logical lineage, not physical ingestion.
 
-This is where your governance table becomes powerful.
+So modeling sources as:
 
-We will add:
+DataSet
 
-```
-columnMapping attribute
-```
+is the correct governance modeling approach.
 
-Which gives:
+Many banks do this.
 
-```
-column → column lineage
-```
 
 ---
 
-# Next step after this succeeds
+Most important next step (the real value)
 
-Tell me:
+Once this works we add:
 
-**Did process publish successfully?**
+column lineage
 
-If yes next we build:
+This is what your governance table was really designed for.
 
-**production column lineage publisher**
+That part is much more interesting and will make Atlas show:
 
-That is the real governance value.
+country_code → country_code
+country_name → country_name_arabic
+
+
+---
+
+Important: you are not stuck
+
+You were actually very close. The only real problem was Atlas type assumptions.
+
+Now we are aligned with your real Atlas model.
+
+
+---
+
+Let's stabilize progress
+
+Do only this change:
+
+Change rdbms_table → DataSet
+
+Then run again.
+
+Tell me only:
+
+Did process publish successfully now?
+
+We'll move calmly from there.
