@@ -1,110 +1,235 @@
-Good point. Let's reset cleanly and **standardize all names and functions** so you don't hit mismatches again.
-We will rebuild this **from zero with consistent naming** and correct Atlas requirements.
+You're right. I skipped the PostgreSQL connection in the last full example and mixed partial snippets across replies.
 
-I will keep **exact function names**, **exact model fields**, and **correct Atlas attributes**.
+Let's reset with one **complete, consistent working set of files** using the names we already established and keeping them stable:
+
+* `governance_reader.py`
+* `lineage_builder.py`
+* `atlas_publisher.py`
+* `test_publish_one_transition.py`
+* `publish_all_transitions.py`
+
+This version includes:
+
+* PostgreSQL connection
+* governance table reading
+* Atlas publishing through `curl --negotiate`
+* `rdbms_db` creation
+* `rdbms_table` creation with required `db`
+* `hive_table` target references
+* one process per transition
+* stable function and field names
 
 ---
 
-# Final clean structure (no surprises later)
+# 1) Folder structure
 
-We will have only **3 files**:
+Use this exact structure:
 
-```
-common/
-│
+```text
+/data01/airflow310/dags/common/
+├── governance_reader.py
 ├── lineage_builder.py
 ├── atlas_publisher.py
-└── test_publish_one_transition.py
+├── test_publish_one_transition.py
+└── publish_all_transitions.py
 ```
 
 ---
 
-# STEP 1 — lineage_builder.py (clean + stable)
+# 2) governance_reader.py
 
-This builds the model correctly.
+This file reads from PostgreSQL table `public.data_like_governance`.
 
-Use EXACTLY this:
+```python
+import psycopg2
+
+
+class GovernanceReader:
+    def __init__(self, host, port, dbname, user, password):
+        self.host = host
+        self.port = port
+        self.dbname = dbname
+        self.user = user
+        self.password = password
+
+    def _connect(self):
+        return psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            dbname=self.dbname,
+            user=self.user,
+            password=self.password
+        )
+
+    def get_transitions(self):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        cur.execute("""
+            select distinct
+                source_schema_name,
+                source_table_name,
+                destination_schema_name,
+                destination_table_name,
+                job_id
+            from public.data_like_governance
+            order by
+                source_schema_name,
+                source_table_name,
+                destination_schema_name,
+                destination_table_name,
+                job_id
+        """)
+
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            result.append({
+                "source_schema_name": r[0],
+                "source_table_name": r[1],
+                "destination_schema_name": r[2],
+                "destination_table_name": r[3],
+                "job_id": r[4]
+            })
+
+        return result
+
+    def get_transition_columns(
+        self,
+        source_schema_name,
+        source_table_name,
+        destination_schema_name,
+        destination_table_name,
+        job_id
+    ):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        cur.execute("""
+            select
+                source_column_name,
+                source_column_name_desc,
+                destination_column_name,
+                destination_column_name_desc,
+                action_type,
+                create_timestamp
+            from public.data_like_governance
+            where source_schema_name = %s
+              and source_table_name = %s
+              and destination_schema_name = %s
+              and destination_table_name = %s
+              and job_id = %s
+            order by source_column_name, destination_column_name
+        """, (
+            source_schema_name,
+            source_table_name,
+            destination_schema_name,
+            destination_table_name,
+            job_id
+        ))
+
+        rows = cur.fetchall()
+
+        cur.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            result.append({
+                "source_column_name": r[0],
+                "source_column_name_desc": r[1],
+                "destination_column_name": r[2],
+                "destination_column_name_desc": r[3],
+                "action_type": r[4],
+                "create_timestamp": str(r[5])
+            })
+
+        return result
+```
+
+---
+
+# 3) lineage_builder.py
+
+This file contains all stable naming rules and model-building functions.
 
 ```python
 def is_hive_schema(schema_name):
-
-    return schema_name.startswith(("brz","slv","gld"))
+    schema_name = schema_name.lower()
+    return schema_name.startswith(("brz", "slv", "gld"))
 
 
 def build_entity_type(schema_name):
-
     if is_hive_schema(schema_name):
-
         return "hive_table"
-
     return "rdbms_table"
 
 
-def build_qualified_name(schema_name,table_name):
-
+def build_qualified_name(schema_name, table_name):
     if is_hive_schema(schema_name):
-
         return f"{schema_name}.{table_name}@cm"
-
     return f"{schema_name}.{table_name}@governance"
 
 
 def build_process_qualified_name(
-    source_schema,
-    source_table,
-    target_schema,
-    target_table,
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name,
     job_id
 ):
+    return (
+        f"airflow://lineage/"
+        f"{source_schema_name}.{source_table_name}"
+        f"__to__"
+        f"{destination_schema_name}.{destination_table_name}"
+        f"/job_{job_id}"
+    )
 
-    return f"airflow://job/{job_id}/{source_schema}.{source_table}_to_{target_schema}.{target_table}"
 
-
-def build_transition_model(transition,columns):
-
-    source_schema = transition["source_schema_name"]
-    source_table  = transition["source_table_name"]
-
-    target_schema = transition["destination_schema_name"]
-    target_table  = transition["destination_table_name"]
-
+def build_transition_model(transition, columns):
+    source_schema_name = transition["source_schema_name"]
+    source_table_name = transition["source_table_name"]
+    destination_schema_name = transition["destination_schema_name"]
+    destination_table_name = transition["destination_table_name"]
     job_id = transition["job_id"]
 
     model = {
+        "job_id": job_id,
 
-        "job_id":job_id,
+        "source_schema_name": source_schema_name,
+        "source_table_name": source_table_name,
+        "destination_schema_name": destination_schema_name,
+        "destination_table_name": destination_table_name,
 
-        "source_type":build_entity_type(source_schema),
+        "source_type": build_entity_type(source_schema_name),
+        "target_type": build_entity_type(destination_schema_name),
 
-        "target_type":build_entity_type(target_schema),
+        "source_name": source_table_name,
+        "target_name": destination_table_name,
 
-        "source_name":source_table,
+        "source_qn": build_qualified_name(source_schema_name, source_table_name),
+        "target_qn": build_qualified_name(destination_schema_name, destination_table_name),
 
-        "target_name":target_table,
-
-        "source_qn":build_qualified_name(
-            source_schema,
-            source_table
+        "process_name": (
+            f"{source_schema_name}.{source_table_name}"
+            f"_to_"
+            f"{destination_schema_name}.{destination_table_name}"
         ),
 
-        "target_qn":build_qualified_name(
-            target_schema,
-            target_table
-        ),
-
-        "process_name":
-        f"{source_schema}.{source_table}_to_{target_schema}.{target_table}",
-
-        "process_qn":
-        build_process_qualified_name(
-            source_schema,
-            source_table,
-            target_schema,
-            target_table,
+        "process_qn": build_process_qualified_name(
+            source_schema_name,
+            source_table_name,
+            destination_schema_name,
+            destination_table_name,
             job_id
         ),
 
-        "columns":columns
+        "columns": columns
     }
 
     return model
@@ -112,204 +237,141 @@ def build_transition_model(transition,columns):
 
 ---
 
-# STEP 2 — atlas_publisher.py (FINAL stable version)
+# 4) atlas_publisher.py
 
-This version fixes:
+This is the final consistent publisher using `curl --negotiate` and creating:
 
-* rdbms_db requirement
-* consistent attribute names
-* process creation
-* no missing fields
-
-Use EXACTLY:
+* `rdbms_db`
+* source `rdbms_table`
+* target entity
+* `Process`
 
 ```python
-import subprocess
 import json
+import subprocess
 import tempfile
 
 
 class AtlasPublisher:
-
-
-    def __init__(self,atlas_url):
-
+    def __init__(self, atlas_url):
         self.atlas_url = atlas_url.rstrip("/")
 
-
-    def post_entity(self,payload):
-
+    def post_entity(self, payload):
         subprocess.run(["klist"])
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            json.dump(payload, f)
+            file_name = f.name
 
-            json.dump(payload,f)
-
-            file_name=f.name
-
-
-        cmd=[
-
+        cmd = [
             "curl",
-
             "--negotiate",
-
-            "-u",":",
-
+            "-u", ":",
             "-k",
-
-            "-H","Content-Type: application/json",
-
-            "-X","POST",
-
+            "-H", "Content-Type: application/json",
+            "-X", "POST",
             f"{self.atlas_url}/api/atlas/v2/entity",
-
-            "-d",f"@{file_name}"
-
+            "-d", f"@{file_name}"
         ]
 
-
-        result=subprocess.run(
+        result = subprocess.run(
             cmd,
             capture_output=True,
             text=True
         )
 
+        print("STDOUT:")
         print(result.stdout)
+        print("STDERR:")
+        print(result.stderr)
 
-        if result.returncode !=0:
-
+        if result.returncode != 0:
             raise Exception(result.stderr)
 
-
-
-    def publish_table_lineage(self,model):
-
-
-        ###################
-        # 1 create rdbms_db
-        ###################
-
-        rdbms_db_payload={
-
-            "entity":{
-
-                "typeName":"rdbms_db",
-
-                "attributes":{
-
-                    "name":"governance_db",
-
-                    "qualifiedName":
-                    "governance_db@governance"
+    def publish_table_lineage(self, model):
+        rdbms_db_payload = {
+            "entity": {
+                "typeName": "rdbms_db",
+                "attributes": {
+                    "name": "governance_db",
+                    "qualifiedName": "governance_db@governance"
                 }
             }
         }
 
-
-        ###################
-        # 2 source table
-        ###################
-
-        source_payload={
-
-            "entity":{
-
-                "typeName":model["source_type"],
-
-                "attributes":{
-
-                    "name":model["source_name"],
-
-                    "qualifiedName":
-                    model["source_qn"],
-
-                    "db":{
-
-                        "typeName":"rdbms_db",
-
-                        "uniqueAttributes":{
-
-                            "qualifiedName":
-                            "governance_db@governance"
+        if model["source_type"] == "rdbms_table":
+            source_payload = {
+                "entity": {
+                    "typeName": "rdbms_table",
+                    "attributes": {
+                        "name": model["source_name"],
+                        "qualifiedName": model["source_qn"],
+                        "db": {
+                            "typeName": "rdbms_db",
+                            "uniqueAttributes": {
+                                "qualifiedName": "governance_db@governance"
+                            }
                         }
                     }
                 }
             }
-        }
-
-
-        ###################
-        # 3 target table
-        ###################
-
-        target_payload={
-
-            "entity":{
-
-                "typeName":model["target_type"],
-
-                "attributes":{
-
-                    "name":model["target_name"],
-
-                    "qualifiedName":
-                    model["target_qn"]
+        else:
+            source_payload = {
+                "entity": {
+                    "typeName": model["source_type"],
+                    "attributes": {
+                        "name": model["source_name"],
+                        "qualifiedName": model["source_qn"]
+                    }
                 }
             }
-        }
 
+        if model["target_type"] == "rdbms_table":
+            target_payload = {
+                "entity": {
+                    "typeName": "rdbms_table",
+                    "attributes": {
+                        "name": model["target_name"],
+                        "qualifiedName": model["target_qn"],
+                        "db": {
+                            "typeName": "rdbms_db",
+                            "uniqueAttributes": {
+                                "qualifiedName": "governance_db@governance"
+                            }
+                        }
+                    }
+                }
+            }
+        else:
+            target_payload = {
+                "entity": {
+                    "typeName": model["target_type"],
+                    "attributes": {
+                        "name": model["target_name"],
+                        "qualifiedName": model["target_qn"]
+                    }
+                }
+            }
 
-
-        ###################
-        # 4 process
-        ###################
-
-        process_payload={
-
-            "entity":{
-
-                "typeName":"Process",
-
-                "attributes":{
-
-                    "name":
-                    model["process_name"],
-
-                    "qualifiedName":
-                    model["process_qn"],
-
-
-                    "inputs":[
-
+        process_payload = {
+            "entity": {
+                "typeName": "Process",
+                "attributes": {
+                    "name": model["process_name"],
+                    "qualifiedName": model["process_qn"],
+                    "inputs": [
                         {
-
-                            "typeName":
-                            model["source_type"],
-
-                            "uniqueAttributes":{
-
-                                "qualifiedName":
-                                model["source_qn"]
+                            "typeName": model["source_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["source_qn"]
                             }
                         }
                     ],
-
-
-                    "outputs":[
-
+                    "outputs": [
                         {
-
-                            "typeName":
-                            model["target_type"],
-
-                            "uniqueAttributes":{
-
-                                "qualifiedName":
-                                model["target_qn"]
+                            "typeName": model["target_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["target_qn"]
                             }
                         }
                     ]
@@ -317,183 +379,207 @@ class AtlasPublisher:
             }
         }
 
+        if model["source_type"] == "rdbms_table" or model["target_type"] == "rdbms_table":
+            print("Publishing rdbms_db entity...")
+            self.post_entity(rdbms_db_payload)
 
-
-        print("Publishing rdbms_db")
-
-        self.post_entity(rdbms_db_payload)
-
-
-        print("Publishing source")
-
+        print("Publishing source entity...")
         self.post_entity(source_payload)
 
-
-        print("Publishing target")
-
+        print("Publishing target entity...")
         self.post_entity(target_payload)
 
-
-        print("Publishing process")
-
+        print("Publishing process entity...")
         self.post_entity(process_payload)
 ```
 
 ---
 
-# STEP 3 — test_publish_one_transition.py
+# 5) test_publish_one_transition.py
 
-Use this stable test:
+This tests one transition from PostgreSQL.
+
+Update the connection values before running.
 
 ```python
+from governance_reader import GovernanceReader
 from lineage_builder import build_transition_model
 from atlas_publisher import AtlasPublisher
 
 
-transition={
+POSTGRES_HOST = "YOUR_PG_HOST"
+POSTGRES_PORT = 5432
+POSTGRES_DBNAME = "YOUR_PG_DB"
+POSTGRES_USER = "YOUR_PG_USER"
+POSTGRES_PASSWORD = "YOUR_PG_PASSWORD"
 
-"job_id":382,
-
-"source_schema_name":"dbo",
-
-"source_table_name":"countries_lookup",
-
-"destination_schema_name":"brz_etimad",
-
-"destination_table_name":"countries_lookup"
-
-}
+ATLAS_URL = "https://YOUR_ATLAS_HOST:31443"
 
 
-
-columns=[{
-
-"source_column_name":"country_code",
-
-"destination_column_name":"country_code"
-
-}]
-
-
-
-model=build_transition_model(
-transition,
-columns
+reader = GovernanceReader(
+    host=POSTGRES_HOST,
+    port=POSTGRES_PORT,
+    dbname=POSTGRES_DBNAME,
+    user=POSTGRES_USER,
+    password=POSTGRES_PASSWORD
 )
 
+transitions = reader.get_transitions()
 
+if not transitions:
+    raise Exception("No transitions found in public.data_like_governance")
 
+transition = transitions[0]
+
+columns = reader.get_transition_columns(
+    transition["source_schema_name"],
+    transition["source_table_name"],
+    transition["destination_schema_name"],
+    transition["destination_table_name"],
+    transition["job_id"]
+)
+
+model = build_transition_model(transition, columns)
+
+print("MODEL:")
 print(model)
 
-
-
-publisher=AtlasPublisher(
-"https://<atlas-host>:31443"
-)
-
-
-
+publisher = AtlasPublisher(ATLAS_URL)
 publisher.publish_table_lineage(model)
 ```
 
 ---
 
-# Why this version will not break again
+# 6) publish_all_transitions.py
 
-We standardized:
+This publishes all transitions from the governance table.
 
-Model fields:
+```python
+from governance_reader import GovernanceReader
+from lineage_builder import build_transition_model
+from atlas_publisher import AtlasPublisher
 
-```
-source_type
-target_type
-source_name
-target_name
-source_qn
-target_qn
-process_name
-process_qn
-columns
-```
 
-Functions:
+POSTGRES_HOST = "YOUR_PG_HOST"
+POSTGRES_PORT = 5432
+POSTGRES_DBNAME = "YOUR_PG_DB"
+POSTGRES_USER = "YOUR_PG_USER"
+POSTGRES_PASSWORD = "YOUR_PG_PASSWORD"
 
-```
-build_entity_type
-build_qualified_name
-build_transition_model
-publish_table_lineage
-```
+ATLAS_URL = "https://YOUR_ATLAS_HOST:31443"
 
-Atlas requirements handled:
 
-```
-rdbms_db ✔
-rdbms_table db reference ✔
-Process ✔
-```
+reader = GovernanceReader(
+    host=POSTGRES_HOST,
+    port=POSTGRES_PORT,
+    dbname=POSTGRES_DBNAME,
+    user=POSTGRES_USER,
+    password=POSTGRES_PASSWORD
+)
 
-Naming consistency:
+publisher = AtlasPublisher(ATLAS_URL)
 
-```
-schema.table@system
+transitions = reader.get_transitions()
+
+print(f"Found {len(transitions)} transitions")
+
+for transition in transitions:
+    print("Publishing transition:", transition)
+
+    columns = reader.get_transition_columns(
+        transition["source_schema_name"],
+        transition["source_table_name"],
+        transition["destination_schema_name"],
+        transition["destination_table_name"],
+        transition["job_id"]
+    )
+
+    model = build_transition_model(transition, columns)
+    print("MODEL:", model)
+
+    publisher.publish_table_lineage(model)
 ```
 
 ---
 
-# What should happen now
+# 7) How to run
 
-When you run:
+Go to the folder:
 
+```bash
+cd /data01/airflow310/dags/common
 ```
+
+Make sure Kerberos ticket exists:
+
+```bash
+klist
+```
+
+If needed:
+
+```bash
+kinit your_user@REALM
+```
+
+Run one transition first:
+
+```bash
 python3 test_publish_one_transition.py
 ```
 
-Atlas should create:
+After it works:
 
-```
-rdbms_db
-
-rdbms_table
-
-hive_table
-
-Process
-```
-
-Atlas UI should show:
-
-```
-countries_lookup (RDBMS)
-      ↓
-countries_lookup (Bronze Hive)
+```bash
+python3 publish_all_transitions.py
 ```
 
 ---
 
-# After this works we move to the real target:
+# 8) What this version solves
 
-Publishing:
+This version correctly handles all the things we discovered:
 
-```
-Source → Bronze → Silver → Gold
-WITH COLUMN LINEAGE
-```
+* PostgreSQL governance table is the source of truth
+* source schemas not starting with `brz/slv/gld` become `rdbms_table`
+* medallion schemas become `hive_table`
+* Hive qualified names use:
 
-This is the real goal.
+  * `schema.table@cm`
+* RDBMS qualified names use:
+
+  * `schema.table@governance`
+* `rdbms_table` requires `db`
+* `rdbms_db` is created first
+* Atlas publishing uses `curl --negotiate`
+* no `requests_kerberos` needed
 
 ---
 
-# Next step after you confirm success
+# 9) What to do after table lineage works
 
-Next we add:
+Once `test_publish_one_transition.py` works and Atlas shows the transition correctly, the next step is to add **column lineage** from `model["columns"]`.
 
-**columnMapping attribute**
+That part should be done only after the table-level publishing is confirmed.
 
-This gives:
+---
 
-FULL column lineage in Atlas UI.
+# 10) One important note
 
-That is the critical step for your governance table.
+This code assumes your governance table columns are exactly these names:
 
-Just confirm this run succeeds.
+* `source_schema_name`
+* `source_table_name`
+* `destination_schema_name`
+* `destination_table_name`
+* `job_id`
+* `source_column_name`
+* `source_column_name_desc`
+* `destination_column_name`
+* `destination_column_name_desc`
+* `action_type`
+* `create_timestamp`
+
+If any one of these differs, tell me the exact column name and I’ll adjust the files consistently.
+
+Start with `test_publish_one_transition.py`. Once it runs, send me the output or the first Atlas response and we’ll move to column lineage.
