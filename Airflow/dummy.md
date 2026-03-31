@@ -1,307 +1,181 @@
-Yes. Since you are inside **CDP 7.1.9 secured cluster**, you actually **do NOT need `requests_kerberos` at all**. That library is only needed when Python must perform Kerberos negotiation itself.
-In your environment you already have:
+The error is clear:
 
-* Kerberos configured ✅
-* kinit working ✅
-* curl --negotiate working ✅
+AttributeError: 'AtlasPublisher' object has no attribute 'publish_table_lineage'
 
-So the simplest and most production-safe method is:
+Because your new AtlasPublisher class only has:
 
-**Use native Kerberos ticket + normal requests library**
+__init__
 
-No extra packages needed.
+post_entity
 
----
 
-# Option 1 (Recommended) — Use Kerberos ticket cache (no extra libs)
+But your test file is still calling:
 
-If you already did:
+publisher.publish_table_lineage(model)
 
-```bash
-kinit airflow@REALM
-```
+So you need to do one of these two fixes.
 
-Python can use the ticket automatically if you just call Atlas normally.
+Best fix
 
-Modify your publisher to:
+Add publish_table_lineage() back into atlas_publisher.py.
 
-```python
-import requests
+Use this full file:
+
+import subprocess
+import json
+import tempfile
+
 
 class AtlasPublisher:
 
     def __init__(self, atlas_url):
-
         self.atlas_url = atlas_url.rstrip("/")
 
-    def post_entity(self,payload):
-
-        response = requests.post(
-
-            f"{self.atlas_url}/api/atlas/v2/entity",
-
-            headers={"Content-Type":"application/json"},
-
-            json=payload,
-
-            verify=False
-
-        )
-
-        print(response.status_code)
-        print(response.text)
-
-        return response
-```
-
-This works **if Airflow runs under a Kerberos authenticated user**.
-
----
-
-# Option 2 (Most common in CDP production) — Use curl from Python
-
-Since curl already works:
-
-```bash
-curl --negotiate -u :
-```
-
-You can call curl from Python (no dependency needed).
-
-This is actually what many secured clusters do.
-
-Modify publisher to:
-
-```python
-import subprocess
-import json
-import tempfile
-
-class AtlasPublisher:
-
-    def __init__(self,atlas_url):
-
-        self.atlas_url = atlas_url
-
-    def post_entity(self,payload):
-
-        with tempfile.NamedTemporaryFile(mode="w",delete=False) as f:
-
-            json.dump(payload,f)
-
-            file_name=f.name
-
-        cmd=[
-            "curl",
-
-            "--negotiate",
-
-            "-u",":",
-
-            "-k",
-
-            "-H","Content-Type: application/json",
-
-            "-X","POST",
-
-            f"{self.atlas_url}/api/atlas/v2/entity",
-
-            "-d",f"@{file_name}"
-        ]
-
-        result=subprocess.run(cmd,capture_output=True,text=True)
-
-        print(result.stdout)
-        print(result.stderr)
-```
-
-This is **very safe and works everywhere**.
-
----
-
-# Option 3 (Best enterprise solution) — Use Atlas username/password (if enabled)
-
-Sometimes Atlas allows:
-
-```python
-requests.post(
-   url,
-   auth=("atlas_user","password")
-)
-```
-
-But CDP usually disables this.
-
-So ignore unless security confirms.
-
----
-
-# Option 4 (Enterprise best practice) — Use keytab inside Airflow
-
-Best architecture:
-
-Airflow task:
-
-```bash
-kinit -kt airflow.keytab airflow@REALM
-python publish_lineage.py
-```
-
-Then Python uses the ticket.
-
-Example Airflow task:
-
-```python
-def publish():
-
-    import os
-
-    os.system(
-        "kinit -kt /etc/security/keytabs/airflow.keytab airflow@REALM"
-    )
-
-    run_lineage()
-```
-
-This is the **real production approach**.
-
----
-
-# What I recommend for your environment
-
-Because you said:
-
-* No internet
-* CDP secured
-* curl already works
-
-Use:
-
-# **Option 2 (curl from Python)**
-
-It is:
-
-* Zero dependency
-* Secure
-* Works with Kerberos
-* Production proven
-* Simple
-
----
-
-# Small architecture correction (important)
-
-Do NOT let Python handle Kerberos.
-
-Let **OS Kerberos handle authentication**.
-
-That is how CDP is designed.
-
-Correct flow:
-
-```text
-Airflow Task
-     ↓
-kinit using keytab
-     ↓
-Python script
-     ↓
-curl --negotiate
-     ↓
-Atlas
-```
-
-This is exactly how Cloudera expects integrations.
-
----
-
-# Small improvement (very important)
-
-Before publishing, always check ticket:
-
-Add:
-
-```python
-subprocess.run(["klist"])
-```
-
-If no ticket → run kinit.
-
----
-
-# Best final approach for you
-
-Use this AtlasPublisher:
-
-```python
-import subprocess
-import json
-import tempfile
-
-class AtlasPublisher:
-
-    def __init__(self,atlas_url):
-
-        self.atlas_url=atlas_url.rstrip("/")
-
-    def post_entity(self,payload):
-
+    def post_entity(self, payload):
         subprocess.run(["klist"])
 
-        with tempfile.NamedTemporaryFile(mode="w",delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            json.dump(payload, f)
+            fname = f.name
 
-            json.dump(payload,f)
-
-            fname=f.name
-
-        cmd=[
-
+        cmd = [
             "curl",
-
             "--negotiate",
-
-            "-u",":",
-
+            "-u", ":",
             "-k",
-
-            "-H","Content-Type: application/json",
-
-            "-X","POST",
-
+            "-H", "Content-Type: application/json",
+            "-X", "POST",
             f"{self.atlas_url}/api/atlas/v2/entity",
-
-            "-d",f"@{fname}"
+            "-d", f"@{fname}"
         ]
 
-        result=subprocess.run(cmd,capture_output=True,text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
+        print("STDOUT:")
         print(result.stdout)
+        print("STDERR:")
+        print(result.stderr)
 
-        if result.returncode !=0:
-
+        if result.returncode != 0:
             raise Exception(result.stderr)
-```
+
+    def publish_table_lineage(self, model):
+        source_payload = {
+            "entity": {
+                "typeName": model["source_type"],
+                "attributes": {
+                    "name": model["source_name"],
+                    "qualifiedName": model["source_qn"]
+                }
+            }
+        }
+
+        target_payload = {
+            "entity": {
+                "typeName": model["target_type"],
+                "attributes": {
+                    "name": model["target_name"],
+                    "qualifiedName": model["target_qn"]
+                }
+            }
+        }
+
+        process_payload = {
+            "entity": {
+                "typeName": "Process",
+                "attributes": {
+                    "name": model["process_name"],
+                    "qualifiedName": model["process_qn"],
+                    "inputs": [
+                        {
+                            "typeName": model["source_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["source_qn"]
+                            }
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "typeName": model["target_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["target_qn"]
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        print("Publishing source entity...")
+        self.post_entity(source_payload)
+
+        print("Publishing target entity...")
+        self.post_entity(target_payload)
+
+        print("Publishing process entity...")
+        self.post_entity(process_payload)
+
 
 ---
 
-# Important production question before next step
+Why this happened
 
-Your Airflow runs:
+Before, your class had a method named something like:
 
-**Standalone OSS Airflow 3 OR inside CDP?**
+publish_table_lineage()
 
-Because next step depends on:
+Then you replaced the file with a simpler version that only contains:
 
-If outside CDP → need keytab config
-If inside CDP → easier
+post_entity()
 
-Answer just:
+But your test script still expects the old method.
 
-**Airflow location:**
+So Python is correct.
 
-* Same cluster node
-* Separate server
-* Docker
-* Kubernetes
 
-Then I give the exact production setup.
+---
+
+What to do now
+
+After saving the full file above, run again:
+
+python3 test_publish_one_transition.py
+
+
+---
+
+If you want the quick temporary fix
+
+Instead of changing the class, you could change the test script to call post_entity() directly, but this is not good because your script already has a model, and you still need to build:
+
+source payload
+
+target payload
+
+process payload
+
+
+So the clean fix is to keep publish_table_lineage().
+
+
+---
+
+Important note
+
+Your screenshot also shows this printed model:
+
+source_type = rdbms_table
+
+target_type = hive_table
+
+
+That part looks good.
+
+So your current blocker is only the missing method, not the lineage model itself.
+
+
+---
+
+Next step after this works
+
+When this succeeds, Atlas should show the table-level connection. After that we move to column lineage using the rows from public.data_like_governance.
