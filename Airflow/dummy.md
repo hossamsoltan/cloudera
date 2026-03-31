@@ -1,508 +1,673 @@
-Yes — **you are correct**, and this is a very important observation.
-This is actually a **known Spark Atlas lineage behavior**.
+Good. Based on the new information, we should build it from the beginning like this:
 
-What you are seeing is normal:
+**What we now know**
 
-Spark often registers source RDBMS tables in Atlas as something like:
+* Atlas is reachable and Kerberos auth works.
+* Hive tables in Atlas use:
 
-```
-spark_process → qualifiedName = huge SQL statement
-```
+  * `typeName = hive_table`
+  * `qualifiedName = schema.table@cm`
+* Source tables should be treated as:
 
-or:
+  * `typeName = rdbms_table`
+* Spark source names are messy and should **not** be trusted.
+* Your governance table `public.data_like_governance` contains all transitions:
 
-```
-jdbc source with full query text
-```
+  * source -> bronze
+  * bronze -> silver
+  * silver -> gold
 
-instead of a clean:
+So the correct design is:
 
-```
-rdbms_table schema.table
-```
-
-This happens because Spark Atlas connector captures:
-
-* JDBC reads
-* SQL queries
-* DataFrame operations
-
-and sometimes stores:
-
-* the **query text**
-  instead of the real table.
-
-So you are right:
-
-**We should NOT depend on Spark-generated source names.**
-
-Instead we should depend on:
-
-**Your governance table** ← this is the correct authoritative source.
-
-This is exactly how mature data governance platforms solve this.
+**Governance table = lineage source of truth**
+**Airflow = publisher**
+**Atlas = target visualization/catalog**
+**Spark lineage stays as extra technical lineage, not the main source**
 
 ---
 
-# Correct strategy (enterprise approach)
+# Final build plan
 
-Instead of:
+We will build this in 4 phases:
 
-```
-Spark source → Hive Bronze
-```
-
-We do:
-
-```
-Governance Source Table → Bronze Hive
-```
-
-Meaning:
-
-You override Spark's messy source representation with your clean governance metadata.
-
-This is correct design.
+1. Read transitions from PostgreSQL
+2. Build Atlas entity references correctly
+3. Publish table-level lineage first
+4. Add column lineage after table lineage works
 
 ---
 
-# New correct architecture
+# Phase 1 — Confirm the data model
 
-Your lineage becomes:
+## Step 1
 
-```
-Governance RDBMS table
-        ↓
-Airflow Process
-        ↓
-Bronze Hive
+Run this query to inspect distinct transitions:
 
-Spark lineage continues:
-Bronze → Silver → Gold
-```
-
-So Atlas will show:
-
-```
-RDBMS Source (clean)
-→ Bronze
-→ Silver
-→ Gold
+```sql
+select distinct
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name
+from public.data_like_governance
+order by 1,2,3,4;
 ```
 
-instead of:
+What this gives you:
 
-```
-Spark SQL text → Bronze
-```
+* every unique table-to-table lineage step
+
+Each distinct row here will become **one Atlas Process**.
 
 ---
 
-# Key decision
+## Step 2
 
-We **create our own clean source table entities** in Atlas.
+Count how many column mappings exist per transition:
 
-Do not reuse Spark source.
+```sql
+select
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name,
+    count(*) as column_count
+from public.data_like_governance
+group by
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name
+order by 1,2,3,4;
+```
 
-This is the correct solution.
+What this gives you:
+
+* how many source-column -> destination-column rows belong to each transition
+
+That is what we will later use for column lineage.
 
 ---
 
-# Phase 1 — Create clean RDBMS source entities
+## Step 3
 
-Instead of using Spark source, we create:
+Confirm whether one transition may belong to multiple job IDs:
 
+```sql
+select
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name,
+    count(distinct job_id) as job_count
+from public.data_like_governance
+group by
+    source_schema_name,
+    source_table_name,
+    destination_schema_name,
+    destination_table_name
+order by 1,2,3,4;
 ```
-rdbms_table entities from governance table
+
+If `job_count` is mostly 1, life is easier.
+If more than 1, we can still handle it, but the process naming must include the job.
+
+---
+
+# Phase 2 — Define the rules
+
+## Step 4
+
+Use these entity type rules:
+
+### Source side
+
+If schema does **not** start with `brz`, `slv`, or `gld`, then:
+
+* `typeName = rdbms_table`
+
+### Destination or internal medallion side
+
+If schema starts with:
+
+* `brz`
+* `slv`
+* `gld`
+
+then:
+
+* `typeName = hive_table`
+
+---
+
+## Step 5
+
+Use these qualifiedName rules:
+
+### Hive table
+
+```python
+def build_hive_qn(schema_name, table_name):
+    return f"{schema_name}.{table_name}@cm"
 ```
+
+### RDBMS source table
+
+Since you do not want to depend on Spark’s weird source names, create your own clean qualifiedName:
+
+```python
+def build_rdbms_qn(schema_name, table_name):
+    return f"{schema_name}.{table_name}@governance"
+```
+
+This is intentional.
+It gives you stable business lineage names.
+
+---
+
+## Step 6
+
+Use one process per transition.
+
+Not one process per whole pipeline.
 
 Example:
 
-From governance:
+* `gca_employees.A -> brz_employees.A` = process 1
+* `brz_employees.A -> slv_employees.A` = process 2
+* `slv_employees.A -> gld_employees.A` = process 3
 
-```
-source_schema = gca_employees
-source_table = ProfEmployeesRASDProfilesHistory
-```
+This is the correct Atlas design.
 
-We create Atlas entity:
+Use process qualifiedName like:
 
+```python
+def build_process_qn(source_schema, source_table, target_schema, target_table, job_id=None):
+    base = f"{source_schema}.{source_table}__to__{target_schema}.{target_table}"
+    if job_id is not None:
+        return f"airflow://lineage/{base}/job_{job_id}"
+    return f"airflow://lineage/{base}"
 ```
-typeName = rdbms_table
-qualifiedName = gca_employees.ProfEmployeesRASDProfilesHistory@governance
-```
-
-We control this naming.
 
 ---
 
-# Phase 2 — Define source naming rule
+# Phase 3 — Build the Python modules
 
-Use a stable pattern:
+Create a folder under your Airflow DAGs area:
 
+```bash
+mkdir -p $AIRFLOW_HOME/dags/common
 ```
-schema.table@governance
-```
-
-Example:
-
-```
-gca_employees.ProfEmployeesRASDProfilesHistory@governance
-```
-
-Do NOT mix with Spark JDBC naming.
-
-This becomes your business lineage source.
 
 ---
 
-# Phase 3 — Build correct lineage chain
+## Step 7 — PostgreSQL reader
 
-Now we build:
+Create:
 
-```
-Governance source table
-→ Bronze Hive table (existing)
-```
-
-Process:
-
-```
-Airflow Job
+```bash
+vi $AIRFLOW_HOME/dags/common/governance_reader.py
 ```
 
-Spark will still show:
+Put this:
 
-```
-Bronze → Silver → Gold
-```
+```python
+import psycopg2
 
-Atlas will merge graphs automatically.
+
+class GovernanceReader:
+    def __init__(self, host, port, dbname, user, password):
+        self.host = host
+        self.port = port
+        self.dbname = dbname
+        self.user = user
+        self.password = password
+
+    def _connect(self):
+        return psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            dbname=self.dbname,
+            user=self.user,
+            password=self.password
+        )
+
+    def get_transitions(self):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        cur.execute("""
+            select distinct
+                source_schema_name,
+                source_table_name,
+                destination_schema_name,
+                destination_table_name,
+                job_id
+            from public.data_like_governance
+            order by 1,2,3,4,5
+        """)
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            result.append({
+                "source_schema_name": r[0],
+                "source_table_name": r[1],
+                "destination_schema_name": r[2],
+                "destination_table_name": r[3],
+                "job_id": r[4],
+            })
+        return result
+
+    def get_transition_columns(self, source_schema, source_table, target_schema, target_table, job_id):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        cur.execute("""
+            select
+                source_column_name,
+                source_column_name_desc,
+                destination_column_name,
+                destination_column_name_desc,
+                action_type,
+                create_timestamp
+            from public.data_like_governance
+            where source_schema_name = %s
+              and source_table_name = %s
+              and destination_schema_name = %s
+              and destination_table_name = %s
+              and job_id = %s
+            order by source_column_name, destination_column_name
+        """, (source_schema, source_table, target_schema, target_table, job_id))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        result = []
+        for r in rows:
+            result.append({
+                "source_column_name": r[0],
+                "source_column_name_desc": r[1],
+                "destination_column_name": r[2],
+                "destination_column_name_desc": r[3],
+                "action_type": r[4],
+                "create_timestamp": str(r[5]),
+            })
+        return result
+```
 
 ---
 
-# Phase 4 — Why this works
+## Step 8 — Lineage model builder
 
-Atlas lineage is graph-based.
+Create:
 
-If two processes share a table:
-
-They connect automatically.
-
-So if we connect:
-
-```
-Source → Bronze
+```bash
+vi $AIRFLOW_HOME/dags/common/lineage_builder.py
 ```
 
-and Spark already connects:
+Put this:
 
-```
-Bronze → Silver → Gold
-```
+```python
+def is_hive_schema(schema_name: str) -> bool:
+    schema_name = schema_name.lower()
+    return schema_name.startswith("brz") or schema_name.startswith("slv") or schema_name.startswith("gld")
 
-Atlas builds:
 
-```
-Source → Bronze → Silver → Gold
-```
+def build_entity_type(schema_name: str) -> str:
+    return "hive_table" if is_hive_schema(schema_name) else "rdbms_table"
 
-This is exactly what you want.
+
+def build_qualified_name(schema_name: str, table_name: str) -> str:
+    if is_hive_schema(schema_name):
+        return f"{schema_name}.{table_name}@cm"
+    return f"{schema_name}.{table_name}@governance"
+
+
+def build_process_qualified_name(source_schema: str, source_table: str,
+                                 target_schema: str, target_table: str,
+                                 job_id) -> str:
+    return (
+        f"airflow://lineage/"
+        f"{source_schema}.{source_table}__to__{target_schema}.{target_table}"
+        f"/job_{job_id}"
+    )
+
+
+def build_transition_model(transition: dict, columns: list[dict]) -> dict:
+    source_schema = transition["source_schema_name"]
+    source_table = transition["source_table_name"]
+    target_schema = transition["destination_schema_name"]
+    target_table = transition["destination_table_name"]
+    job_id = transition["job_id"]
+
+    return {
+        "job_id": job_id,
+        "source_type": build_entity_type(source_schema),
+        "target_type": build_entity_type(target_schema),
+        "source_name": source_table,
+        "target_name": target_table,
+        "source_qn": build_qualified_name(source_schema, source_table),
+        "target_qn": build_qualified_name(target_schema, target_table),
+        "process_name": f"{source_schema}.{source_table}_to_{target_schema}.{target_table}",
+        "process_qn": build_process_qualified_name(
+            source_schema, source_table, target_schema, target_table, job_id
+        ),
+        "columns": columns,
+    }
+```
 
 ---
 
-# Phase 5 — Correct workflow now
+## Step 9 — Atlas publisher
 
-We ignore Spark source.
+Create:
 
-We build:
-
-### Step 1 — create RDBMS source table entity
-
-### Step 2 — create Process linking:
-
-```
-Source → Bronze
+```bash
+vi $AIRFLOW_HOME/dags/common/atlas_publisher.py
 ```
 
-### Step 3 — Spark already provides:
+Put this:
 
-```
-Bronze → Silver → Gold
-```
+```python
+import requests
+from requests_kerberos import HTTPKerberosAuth, OPTIONAL
 
-### Step 4 — later add column mapping.
+
+class AtlasPublisher:
+    def __init__(self, atlas_url: str):
+        self.atlas_url = atlas_url.rstrip("/")
+        self.auth = HTTPKerberosAuth(mutual_authentication=OPTIONAL)
+
+    def post_entity(self, payload: dict):
+        response = requests.post(
+            f"{self.atlas_url}/api/atlas/v2/entity",
+            auth=self.auth,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            verify=False,
+            timeout=30,
+        )
+        print("Atlas status:", response.status_code)
+        print(response.text)
+        response.raise_for_status()
+        return response.json()
+
+    def publish_table_lineage(self, model: dict):
+        source_payload = {
+            "entity": {
+                "typeName": model["source_type"],
+                "attributes": {
+                    "name": model["source_name"],
+                    "qualifiedName": model["source_qn"],
+                }
+            }
+        }
+
+        target_payload = {
+            "entity": {
+                "typeName": model["target_type"],
+                "attributes": {
+                    "name": model["target_name"],
+                    "qualifiedName": model["target_qn"],
+                }
+            }
+        }
+
+        process_payload = {
+            "entity": {
+                "typeName": "Process",
+                "attributes": {
+                    "name": model["process_name"],
+                    "qualifiedName": model["process_qn"],
+                    "inputs": [
+                        {
+                            "typeName": model["source_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["source_qn"]
+                            }
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "typeName": model["target_type"],
+                            "uniqueAttributes": {
+                                "qualifiedName": model["target_qn"]
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        self.post_entity(source_payload)
+        self.post_entity(target_payload)
+        self.post_entity(process_payload)
+```
 
 ---
 
-# Phase 6 — Build source entity payload
+# Phase 4 — Test outside Airflow first
 
-Example:
+## Step 10 — Create a standalone test
 
+Create:
+
+```bash
+vi test_publish_one_transition.py
 ```
-source_table.json
-```
 
-```json
-{
- "entity":{
+Put this:
 
-  "typeName":"rdbms_table",
+```python
+from common.governance_reader import GovernanceReader
+from common.lineage_builder import build_transition_model
+from common.atlas_publisher import AtlasPublisher
 
-  "attributes":{
+reader = GovernanceReader(
+    host="POSTGRES_HOST",
+    port=5432,
+    dbname="POSTGRES_DB",
+    user="POSTGRES_USER",
+    password="POSTGRES_PASSWORD"
+)
 
-   "name":"ProfEmployeesRASDProfilesHistory",
+transitions = reader.get_transitions()
 
-   "qualifiedName":"gca_employees.ProfEmployeesRASDProfilesHistory@governance"
+# Pick the first one for testing
+transition = transitions[0]
 
-  }
+columns = reader.get_transition_columns(
+    transition["source_schema_name"],
+    transition["source_table_name"],
+    transition["destination_schema_name"],
+    transition["destination_table_name"],
+    transition["job_id"]
+)
 
- }
-}
+model = build_transition_model(transition, columns)
+print(model)
+
+publisher = AtlasPublisher("https://ATLAS_HOST:31443")
+publisher.publish_table_lineage(model)
 ```
 
 Run:
 
-```
-curl --negotiate -u : -k \
--H "Content-Type: application/json" \
--X POST \
-https://atlas/api/atlas/v2/entity \
--d @source_table.json
+```bash
+kinit your_user@REALM
+python test_publish_one_transition.py
 ```
 
-Now Atlas has clean source.
+Then check Atlas UI.
+
+Expected result:
+
+* source entity exists
+* target entity exists
+* process exists
+* lineage between them exists
 
 ---
 
-# Phase 7 — Build process linking source to bronze
+# Phase 5 — Publish all transitions
 
-Example:
-
-```
-process.json
-```
-
-```json
-{
- "entity":{
-
-  "typeName":"Process",
-
-  "attributes":{
-
-   "name":"job_55",
-
-   "qualifiedName":"airflow://job/55",
-
-   "inputs":[
-
-    {
-
-     "typeName":"rdbms_table",
-
-     "uniqueAttributes":{
-
-      "qualifiedName":"gca_employees.ProfEmployeesRASDProfilesHistory@governance"
-
-     }
-
-    }
-
-   ],
-
-   "outputs":[
-
-    {
-
-     "typeName":"hive_table",
-
-     "uniqueAttributes":{
-
-      "qualifiedName":"brz_employees.ProfEmployeesRASDProfilesHistory@cm"
-
-     }
-
-    }
-
-   ]
-
-  }
-
- }
-}
-```
-
-Run same curl.
-
----
-
-# Phase 8 — Result in Atlas
-
-Now Atlas graph becomes:
-
-```
-gca_employees table
-→ Bronze table
-→ Silver table
-→ Gold table
-```
-
-Clean lineage.
-
----
-
-# Phase 9 — Automate from governance table
-
-Now Python logic becomes:
-
-For each job:
-
-1 read governance rows
-2 create source entity if not exists
-3 build source qualifiedName
-4 build target qualifiedName
-5 publish process
-
----
-
-# Phase 10 — Correct Python naming functions
-
-Use:
-
-```python
-def build_source_qn(schema,table):
-
-    return f"{schema}.{table}@governance"
-
-
-def build_hive_qn(schema,table):
-
-    return f"{schema}.{table}@cm"
-```
-
----
-
-# Phase 11 — Why this is correct approach
-
-Because:
-
-Spark source lineage = technical
-Governance table = business truth
-
-Enterprise lineage always prefers business metadata.
-
-You are doing it correctly.
-
----
-
-# Phase 12 — Next correct step
-
-Now we do:
-
-**Step 1 production approach**
-
-Implement:
-
-```
-create source entity
-create process linking source → bronze
-```
-
-Only.
-
-Do not do column lineage yet.
-
----
-
-# What you should do now
-
-Do these 3 steps:
-
-### Step 1
-
-Pick one job.
-
-Example:
-
-```
-job_id = 55
-```
-
-### Step 2
-
-From governance row take:
-
-```
-source_schema
-source_table
-
-destination_schema
-destination_table
-```
-
-### Step 3
+## Step 11 — Create a bulk publisher test
 
 Create:
 
-```
-source_table.json
-process.json
+```bash
+vi test_publish_all_transitions.py
 ```
 
-Run manually.
+Put this:
+
+```python
+from common.governance_reader import GovernanceReader
+from common.lineage_builder import build_transition_model
+from common.atlas_publisher import AtlasPublisher
+
+reader = GovernanceReader(
+    host="POSTGRES_HOST",
+    port=5432,
+    dbname="POSTGRES_DB",
+    user="POSTGRES_USER",
+    password="POSTGRES_PASSWORD"
+)
+
+publisher = AtlasPublisher("https://ATLAS_HOST:31443")
+
+transitions = reader.get_transitions()
+
+for transition in transitions:
+    print("Publishing transition:", transition)
+
+    columns = reader.get_transition_columns(
+        transition["source_schema_name"],
+        transition["source_table_name"],
+        transition["destination_schema_name"],
+        transition["destination_table_name"],
+        transition["job_id"]
+    )
+
+    model = build_transition_model(transition, columns)
+    publisher.publish_table_lineage(model)
+```
+
+Run it only after the one-transition test works.
 
 ---
 
-# After this works
+# Phase 6 — Integrate with Airflow
 
-Next I will give:
+## Step 12 — Build one Airflow DAG
 
-**Column lineage payload (most important part)**
+Create:
 
-Because your governance table is column level.
-
-That will give:
-
-```
-Column lineage
-Action types
-Business mapping
+```bash
+vi $AIRFLOW_HOME/dags/publish_governance_lineage.py
 ```
 
-Which is your real goal.
+Put this:
+
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+from common.governance_reader import GovernanceReader
+from common.lineage_builder import build_transition_model
+from common.atlas_publisher import AtlasPublisher
+
+
+def publish_all_lineage():
+    reader = GovernanceReader(
+        host="POSTGRES_HOST",
+        port=5432,
+        dbname="POSTGRES_DB",
+        user="POSTGRES_USER",
+        password="POSTGRES_PASSWORD"
+    )
+
+    publisher = AtlasPublisher("https://ATLAS_HOST:31443")
+
+    transitions = reader.get_transitions()
+
+    for transition in transitions:
+        columns = reader.get_transition_columns(
+            transition["source_schema_name"],
+            transition["source_table_name"],
+            transition["destination_schema_name"],
+            transition["destination_table_name"],
+            transition["job_id"]
+        )
+
+        model = build_transition_model(transition, columns)
+        publisher.publish_table_lineage(model)
+
+
+with DAG(
+    dag_id="publish_governance_lineage",
+    start_date=datetime(2025, 1, 1),
+    schedule=None,
+    catchup=False
+) as dag:
+
+    publish_lineage_task = PythonOperator(
+        task_id="publish_lineage_task",
+        python_callable=publish_all_lineage
+    )
+```
+
+Run it manually first.
 
 ---
 
-# Important conclusion
+# Phase 7 — What you should expect in Atlas
 
-You discovered the correct architecture insight:
+After this, Atlas should show a clean graph like:
 
-**Never trust Spark JDBC source names for governance lineage.**
+* `rdbms_table` -> `hive_table(brz...)`
+* `hive_table(brz...)` -> `hive_table(slv...)`
+* `hive_table(slv...)` -> `hive_table(gld...)`
 
-Use governance metadata.
-
-That is exactly how:
-
-* banks
-* telecom
-* insurance
-  implement Atlas lineage.
+That already gives you the full table-level chain.
 
 ---
 
-# Next thing I need from you
+# Phase 8 — Then add column lineage
 
-Send one example:
+Do **not** start with columns now.
 
-```
-source_schema
-source_table
-destination_schema
-destination_table
-job_id
-```
+First confirm the full table chain works.
 
-Then I will give you:
+After that, we enhance the `Process` payload using the column mappings from your governance table.
 
-**Exact final payload + automation script.**
+That is phase 2.
+
+---
+
+# What you should do right now
+
+Do exactly this order:
+
+1. Run the distinct transition SQL.
+2. Create `governance_reader.py`.
+3. Create `lineage_builder.py`.
+4. Create `atlas_publisher.py`.
+5. Run `test_publish_one_transition.py`.
+6. Check Atlas UI.
+7. Run `test_publish_all_transitions.py`.
+8. Only then create the Airflow DAG.
+
+When the one-transition test succeeds, send me:
+
+* one real source schema/table
+* one real target schema/table
+* whether Atlas showed the new process correctly
+
+Then I’ll give you the **next phase: column lineage payload**.
