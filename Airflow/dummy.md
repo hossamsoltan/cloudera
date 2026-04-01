@@ -1,48 +1,43 @@
-Perfect. Now we move to the **real first implementation step**.
+Great. Foundation is working.
 
-This step will only create the **DAG skeleton + connection test + reading the watermark**.
-No Atlas yet. No transformation yet. We build the foundation first (professional approach).
+## Step 3 — Add batch extraction logic
 
----
+Now we move from just counting rows to actually reading the **next batch** from PostgreSQL.
 
-# Step 2 — Create the first Airflow DAG skeleton
+### Goal of this step
 
-## Goal of this step
+Update the DAG so it:
 
-Create a DAG that:
+* reads `gca_atlas_last_governance_id`
+* fetches the next batch from the join between:
 
-* reads the Airflow Variable `gca_atlas_last_governance_id`
-* connects to PostgreSQL using your existing Airflow connection
-* prints how many rows are pending
-* does nothing else yet
+  * `public.data_like_governance`
+  * `public.data_transfer_job`
+* prints:
 
-This validates:
+  * number of fetched rows
+  * first few sample records
+  * max `governance_id` in the batch
 
-* Variable works
-* PostgreSQL connection works
-* DAG structure is correct
-
----
-
-# 1) DAG file location
-
-Go to your Airflow DAG folder (example):
-
-```
-/opt/airflow/dags/
-```
-
-Create file:
-
-```
-gca_governance_to_atlas.py
-```
+Still no Atlas push yet.
 
 ---
 
-# 2) First DAG skeleton (clean production structure)
+## 1) Decide batch size
 
-Create this file:
+For now, use:
+
+```python
+BATCH_SIZE = 1000
+```
+
+Since your pending rows are **58,064**, this means about **59 batches**, which is very manageable.
+
+---
+
+## 2) Replace your DAG code with this version
+
+Use this full file:
 
 ```python
 from datetime import datetime
@@ -53,10 +48,11 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 
 DAG_NAME = "gca_governance_to_atlas"
+POSTGRES_CONN_ID = "YOUR_POSTGRES_CONNECTION"
+BATCH_SIZE = 1000
 
 
-def check_governance_source():
-
+def extract_governance_batch():
     # Read watermark
     last_id = int(
         Variable.get(
@@ -66,170 +62,141 @@ def check_governance_source():
     )
 
     print(f"Last processed governance_id: {last_id}")
+    print(f"Batch size: {BATCH_SIZE}")
 
     # Connect to PostgreSQL
-    pg = PostgresHook(
-        postgres_conn_id="YOUR_POSTGRES_CONNECTION"
-    )
+    pg = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
-    # Check pending rows
+    # Main batch extraction query
     sql = """
-    SELECT count(*)
-    FROM public.data_like_governance
-    WHERE governance_id > %s
+    SELECT
+        g.governance_id,
+        g.action_type,
+        g.create_timestamp,
+        g.source_column_name_desc,
+        g.source_schema_name,
+        g.source_table_name,
+        g.destination_column_name,
+        g.destination_column_name_desc,
+        g.destination_schema_name,
+        g.destination_table_name,
+        g.job_id,
+        g.source_column_name,
+        j.job_cd,
+        j.data_src_conn_cd,
+        j.dest_conn_cd,
+        j.sql_query
+    FROM public.data_like_governance g
+    LEFT JOIN public.data_transfer_job j
+        ON g.job_id = j.job_id
+    WHERE g.governance_id > %s
+    ORDER BY g.governance_id
+    LIMIT %s
     """
 
-    result = pg.get_first(
+    records = pg.get_records(
         sql,
-        parameters=(last_id,)
+        parameters=(last_id, BATCH_SIZE)
     )
 
-    print(f"Pending rows: {result[0]}")
+    row_count = len(records)
+    print(f"Fetched rows in batch: {row_count}")
+
+    if row_count == 0:
+        print("No new rows found.")
+        return
+
+    # Print first 3 rows as sample
+    preview_count = min(3, row_count)
+    for i in range(preview_count):
+        row = records[i]
+        print(f"Sample row {i + 1}: {row}")
+
+    # Get max governance_id in this batch
+    max_governance_id = max(row[0] for row in records)
+    print(f"Max governance_id in batch: {max_governance_id}")
 
 
 with DAG(
-
     dag_id=DAG_NAME,
-
-    start_date=datetime(2024,1,1),
-
+    start_date=datetime(2024, 1, 1),
     schedule=None,
-
     catchup=False,
-
-    tags=["GCA","ATLAS","GOVERNANCE"]
-
+    tags=["GCA", "ATLAS", "GOVERNANCE"]
 ) as dag:
 
-
-    check_source = PythonOperator(
-
-        task_id="check_governance_source",
-
-        python_callable=check_governance_source
-
+    extract_batch = PythonOperator(
+        task_id="extract_governance_batch",
+        python_callable=extract_governance_batch
     )
 
-
-    check_source
+    extract_batch
 ```
 
 ---
 
-# 3) Replace connection name
+## 3) Important
 
-Replace:
+Replace this line:
 
 ```python
-postgres_conn_id="YOUR_POSTGRES_CONNECTION"
+POSTGRES_CONN_ID = "YOUR_POSTGRES_CONNECTION"
 ```
 
-with your real Airflow connection name.
-
-Example:
-
-```
-postgres_conn_id="postgres_datalike"
-```
-
-Use exactly the connection you already created.
+with your real Airflow PostgreSQL connection id.
 
 ---
 
-# 4) Deploy DAG
+## 4) Trigger the DAG
 
-After saving file:
+Run it again from Airflow UI.
 
-Either wait scheduler refresh OR run:
+Expected log shape:
 
-```bash
-airflow dags list
-```
-
-You should see:
-
-```
-gca_governance_to_atlas
-```
-
----
-
-# 5) Test DAG
-
-Open Airflow UI:
-
-```
-DAGs → gca_governance_to_atlas
-```
-
-Click:
-
-```
-Trigger DAG
-```
-
-Then open logs.
-
-Expected output:
-
-Example:
-
-```
+```text
 Last processed governance_id: 0
-Pending rows: 298734
+Batch size: 1000
+Fetched rows in batch: 1000
+Sample row 1: (...)
+Sample row 2: (...)
+Sample row 3: (...)
+Max governance_id in batch: 1000
 ```
+
+The exact max id may differ, because your IDs may not be perfectly sequential.
 
 ---
 
-# 6) What we are validating now
+## 5) What to check carefully
 
-We are confirming:
+I want you to look at the sample rows in logs and confirm these fields are appearing correctly:
 
-✔ Variable works
-✔ PostgreSQL hook works
-✔ Query works
-✔ DAG execution works
-✔ Logging works
+* `governance_id`
+* `job_id`
+* `job_cd`
+* `data_src_conn_cd`
+* `dest_conn_cd`
+* `source_schema_name`
+* `source_table_name`
+* `source_column_name`
+* `destination_schema_name`
+* `destination_table_name`
+* `destination_column_name`
+* `sql_query`
 
-This prevents debugging later when complexity increases.
+Especially confirm:
 
----
-
-# 7) Possible errors (normal)
-
-If error appears like:
-
-### Connection error
-
-Fix connection name.
-
-### Module error:
-
-```
-No module airflow.providers.postgres
-```
-
-Tell me.
-
-### Permission error:
-
-Tell me.
+* `dest_conn_cd` is really coming correctly
+* Excel-like rows show null/empty schema/table as expected
+* `job_cd` is populated for the matched rows
 
 ---
 
-# When done tell me:
+## 6) Reply with this
 
-Reply with:
+Send me:
 
-**Step 2 done**
+* **Step 3 done**
+* one sample row from the log, with sensitive SQL text shortened if needed
 
-and copy the output like:
-
-```
-Last processed governance_id: X
-Pending rows: X
-```
-
-Then we move to:
-
-**Step 3 → Batch extraction logic (real pipeline begins)**
+Then I will give you **Step 4: normalize and classify each row into hive / rdbms / excel**, which is the first real mapping step before Atlas.
