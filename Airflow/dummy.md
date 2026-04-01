@@ -1,57 +1,111 @@
-Great. Next is the right point to prepare Atlas itself.
+Perfect — that is better for production.
 
-## Step 7 — Create the Atlas types before sending entities
+We will change from:
 
-Because Atlas exposes a type-definition API at `/v2/types/typedefs` and bulk entity creation at `/v2/entity/bulk`, the clean sequence is:
+* **Knox + LDAP**
 
-1. create your custom types once
-2. then start sending entities in later steps. ([Apache Atlas][1])
+to:
 
-Also, since you want custom attributes like `job_id`, `job_cd`, `sql_query`, and the owner relation from column to dataset, it is safer to use your own custom types rather than trying to force all of that into the built-in types. Atlas supports custom entity types and separate relationship definitions through the type system. ([Apache Atlas][2])
+* **Atlas direct URL + Kerberos authentication**
 
-### What we will create
+So Step 7 will be repeated in the new correct form.
 
-We will create exactly 3 items:
+# Step 7 — Create Atlas types using direct Atlas URL with Kerberos
+
+## Goal
+
+Create these Atlas types directly on Atlas:
 
 * `gca_dataset`
 * `gca_column`
-* `gca_column_to_dataset` relationship
+* `gca_column_to_dataset`
 
-For now I recommend we **keep Atlas `Process` for the next step only if your Atlas accepts it with minimal attributes**. If it becomes strict, we will switch to `gca_process` after that. Right now, do not create `gca_process` yet.
+using:
 
-## 7.1 First, test Atlas through Knox
+* direct Atlas endpoint
+* Kerberos ticket authentication
 
-Run this from the Airflow server or any server that can reach Knox.
+---
 
-Replace:
+# 1) First verify Kerberos works on the server
 
-* `KNOX_URL`
-* `USERNAME`
-* `PASSWORD`
+On the server where you will run the command, first make sure you have a valid Kerberos ticket.
 
-Example shape:
+Run:
 
 ```bash
-curl -k -u 'USERNAME:PASSWORD' \
-  'https://KNOX_URL/api/atlas/v2/types/entitydef/name/gca_dataset'
+klist
 ```
 
-Expected:
+If no valid ticket exists, run:
 
-* `404` or “not found” if the type does not exist yet
-* `200` if it already exists
+```bash
+kinit your_user@YOUR.REALM
+```
 
-Atlas documents the `/v2/types/entitydef/name/{name}` endpoint for reading an entity definition by name. ([Apache Atlas][1])
+Then confirm again:
 
-## 7.2 Create a typedef JSON file
+```bash
+klist
+```
 
-Create a file, for example:
+You must see a valid TGT before calling Atlas.
+
+---
+
+# 2) Atlas direct URL format
+
+Use the direct Atlas URL, usually like one of these:
+
+```bash
+http://atlas-host:21000
+```
+
+or
+
+```bash
+https://atlas-host:21443
+```
+
+You should use your actual direct Atlas URL.
+
+Example placeholder:
+
+```bash
+ATLAS_URL=http://your-atlas-host:21000
+```
+
+---
+
+# 3) Test direct Atlas access with Kerberos
+
+Run this first:
+
+```bash
+curl --negotiate -u : \
+  -X GET \
+  "${ATLAS_URL}/api/atlas/v2/types/entitydef/name/gca_dataset"
+```
+
+### Expected result
+
+* if type does not exist: not found / 404
+* if it already exists: returns JSON
+* if Kerberos/auth issue: unauthorized / 401 / forbidden / SPNEGO problem
+
+If this fails, stop here and send me the error.
+
+---
+
+# 4) Create the typedef JSON file
+
+Create file:
 
 ```bash
 vi /tmp/gca_atlas_types.json
 ```
 
-Put this content in it:
+Put this content exactly:
 
 ```json
 {
@@ -257,57 +311,85 @@ Put this content in it:
 }
 ```
 
-## 7.3 Create the types in Atlas
+---
+
+# 5) Create the Atlas types using Kerberos
 
 Run:
 
 ```bash
-curl -k -u 'USERNAME:PASSWORD' \
-  -H 'Content-Type: application/json' \
+curl --negotiate -u : \
+  -H "Content-Type: application/json" \
   -X POST \
   --data @/tmp/gca_atlas_types.json \
-  'https://KNOX_URL/api/atlas/v2/types/typedefs'
+  "${ATLAS_URL}/api/atlas/v2/types/typedefs"
 ```
 
-Atlas documents `/v2/types/typedefs` as the CRUD endpoint for type definitions. ([Apache Atlas][1])
+---
 
-## 7.4 Verify the created types
+# 6) Verify the created types
 
-Run these:
+Run these 3 checks:
 
 ```bash
-curl -k -u 'USERNAME:PASSWORD' \
-  'https://KNOX_URL/api/atlas/v2/types/entitydef/name/gca_dataset'
+curl --negotiate -u : \
+  -X GET \
+  "${ATLAS_URL}/api/atlas/v2/types/entitydef/name/gca_dataset"
 ```
 
 ```bash
-curl -k -u 'USERNAME:PASSWORD' \
-  'https://KNOX_URL/api/atlas/v2/types/entitydef/name/gca_column'
+curl --negotiate -u : \
+  -X GET \
+  "${ATLAS_URL}/api/atlas/v2/types/entitydef/name/gca_column"
 ```
-
-And this one for the relationship:
 
 ```bash
-curl -k -u 'USERNAME:PASSWORD' \
-  'https://KNOX_URL/api/atlas/v2/types/relationshipdef/name/gca_column_to_dataset'
+curl --negotiate -u : \
+  -X GET \
+  "${ATLAS_URL}/api/atlas/v2/types/relationshipdef/name/gca_column_to_dataset"
 ```
 
-Atlas documents both entity-definition and relationship-definition lookup-by-name endpoints. ([Apache Atlas][1])
+---
 
-## Small note on your DAG warnings
+# 7) If curl gives Kerberos/SPNEGO issue
 
-Your run log showed deprecation warnings around `airflow.models.Variable`. In Airflow 3, Variables are documented under `from airflow.sdk import Variable`, so we should clean that import in a later refactor, though it is not blocking your current prototype. ([Apache Airflow][3])
+Try with:
 
-## What I need from you now
+```bash
+curl --negotiate -u : -b ~/cookiejar.txt -c ~/cookiejar.txt \
+  -X GET \
+  "${ATLAS_URL}/api/atlas/v2/types/entitydef/name/gca_dataset"
+```
 
-Do this step only, then reply with one of these:
+But first try the simpler one.
+
+---
+
+# 8) Important note before next step
+
+We have only created:
+
+* `gca_dataset`
+* `gca_column`
+* `gca_column_to_dataset`
+
+We did **not** yet create:
+
+* `gca_process`
+
+In the next step, when we start pushing entities, we will decide whether:
+
+* standard `Process` is enough
+* or we create custom `gca_process`
+
+My recommendation is likely we will create **`gca_process`** too, because you need custom attributes cleanly.
+
+---
+
+# What I need from you now
+
+Run this step and reply with one of these:
 
 * `Step 7 done - types created`
 * `Step 7 done - already existed`
-* or paste the Atlas error message if the POST fails
-
-After that I’ll give you **Step 8: modify the DAG to push one small test batch into Atlas using `/v2/entity/bulk`**.
-
-[1]: https://atlas.apache.org/api/v2/index.html "Atlas REST API"
-[2]: https://atlas.apache.org/1.2.0/api/v2/index.html "Atlas REST API"
-[3]: https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/variables.html?utm_source=chatgpt.com "Variables — Airflow 3.1.8 Documentation"
+* or paste the exact Atlas/Kerberos error message
