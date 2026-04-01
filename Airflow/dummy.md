@@ -1,44 +1,83 @@
-Perfect. We continue.
+Excellent.
 
-## Step 4 — Normalize and classify each governance row
+## Step 5 — Build the final Atlas qualified names
 
-Now we build the first real transformation layer before Atlas.
+Now we move to the most important transformation step before pushing to Atlas.
 
 ### Goal of this step
 
-For every extracted row, we will:
+For each normalized record, generate:
 
-* normalize `data_src_conn_cd` and `dest_conn_cd`
-* remove `_UAT` if it exists
-* lowercase the values
-* classify source type:
+* `src_dataset_qn`
+* `src_column_qn`
+* `dst_dataset_qn`
+* `dst_column_qn`
+* `process_qn`
 
-  * `excel`
-  * `hive`
-  * `rdbms`
-* classify destination type the same way
-* prepare clean normalized records for the next Atlas-building step
+and also clean display names for:
 
-Still no Atlas push yet.
+* source dataset
+* destination dataset
+* source column
+* destination column
+* process name
+
+This step still does **not** push to Atlas.
+It only prepares the exact identifiers we will later use in Atlas entities.
 
 ---
 
-## What this step will produce
+## Qualified name rules we will implement
 
-For each raw row, we will derive fields like:
+### Dataset qualified name
 
-* `src_conn_norm`
-* `dst_conn_norm`
-* `src_type`
-* `dst_type`
-* `src_schema_norm`
-* `src_table_norm`
-* `src_column_norm`
-* `dst_schema_norm`
-* `dst_table_norm`
-* `dst_column_norm`
+#### Hive / RDBMS
 
-This is important because all later qualified names will depend on these normalized values.
+```text
+{conn}.{schema}.{table}@datalikegovernance
+```
+
+#### Excel
+
+```text
+excel.{conn}.default.logical_table@datalikegovernance
+```
+
+---
+
+### Column qualified name
+
+#### Hive / RDBMS
+
+```text
+{conn}.{schema}.{table}.{column}@datalikegovernance
+```
+
+#### Excel
+
+```text
+excel.{conn}.default.logical_table.{column}@datalikegovernance
+```
+
+---
+
+### Process qualified name
+
+```text
+process.{job_id}.{src_conn}.{src_schema}.{src_table}.{src_col}.{dst_conn}.{dst_schema}.{dst_table}.{dst_col}@datalikegovernance
+```
+
+### Process display name
+
+```text
+job_cd
+```
+
+If `job_cd` is null, fallback:
+
+```text
+job_{job_id}
+```
 
 ---
 
@@ -55,6 +94,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 DAG_NAME = "gca_governance_to_atlas"
 POSTGRES_CONN_ID = "datalike_db"
 BATCH_SIZE = 1000
+QN_NAMESPACE = "@datalikegovernance"
 
 
 def safe_str(value):
@@ -93,7 +133,6 @@ def classify_type(conn_code, schema_name, table_name):
     schema_name = safe_str(schema_name)
     table_name = safe_str(table_name)
 
-    # Excel-like case: no schema and no table
     if not schema_name and not table_name:
         return "excel"
 
@@ -101,6 +140,53 @@ def classify_type(conn_code, schema_name, table_name):
         return "hive"
 
     return "rdbms"
+
+
+def build_dataset_qn(conn_norm, obj_type, schema_norm, table_norm):
+    if obj_type == "excel":
+        return f"excel.{conn_norm}.default.logical_table{QN_NAMESPACE}"
+    return f"{conn_norm}.{schema_norm}.{table_norm}{QN_NAMESPACE}"
+
+
+def build_column_qn(conn_norm, obj_type, schema_norm, table_norm, column_norm):
+    if obj_type == "excel":
+        return f"excel.{conn_norm}.default.logical_table.{column_norm}{QN_NAMESPACE}"
+    return f"{conn_norm}.{schema_norm}.{table_norm}.{column_norm}{QN_NAMESPACE}"
+
+
+def build_process_qn(
+    job_id,
+    src_conn_norm,
+    src_schema_norm,
+    src_table_norm,
+    src_column_norm,
+    dst_conn_norm,
+    dst_schema_norm,
+    dst_table_norm,
+    dst_column_norm
+):
+    return (
+        f"process.{job_id}."
+        f"{src_conn_norm}.{src_schema_norm}.{src_table_norm}.{src_column_norm}."
+        f"{dst_conn_norm}.{dst_schema_norm}.{dst_table_norm}.{dst_column_norm}"
+        f"{QN_NAMESPACE}"
+    )
+
+
+def build_dataset_display_name(obj_type, conn_norm, schema_norm, table_norm):
+    if obj_type == "excel":
+        return f"{conn_norm}.logical_table"
+    return f"{schema_norm}.{table_norm}"
+
+
+def build_column_display_name(obj_type, table_norm, column_norm):
+    if obj_type == "excel":
+        return f"logical_table.{column_norm}"
+    return f"{table_norm}.{column_norm}"
+
+
+def build_process_display_name(job_cd, job_id):
+    return job_cd if job_cd else f"job_{job_id}"
 
 
 def normalize_record(row):
@@ -176,7 +262,84 @@ def normalize_record(row):
     return normalized
 
 
-def extract_and_normalize_batch():
+def enrich_with_qualified_names(rec):
+    rec["src_dataset_qn"] = build_dataset_qn(
+        rec["src_conn_norm"],
+        rec["src_type"],
+        rec["src_schema_norm"],
+        rec["src_table_norm"]
+    )
+
+    rec["src_column_qn"] = build_column_qn(
+        rec["src_conn_norm"],
+        rec["src_type"],
+        rec["src_schema_norm"],
+        rec["src_table_norm"],
+        rec["src_column_norm"]
+    )
+
+    rec["dst_dataset_qn"] = build_dataset_qn(
+        rec["dst_conn_norm"],
+        rec["dst_type"],
+        rec["dst_schema_norm"],
+        rec["dst_table_norm"]
+    )
+
+    rec["dst_column_qn"] = build_column_qn(
+        rec["dst_conn_norm"],
+        rec["dst_type"],
+        rec["dst_schema_norm"],
+        rec["dst_table_norm"],
+        rec["dst_column_norm"]
+    )
+
+    rec["process_qn"] = build_process_qn(
+        rec["job_id"],
+        rec["src_conn_norm"],
+        rec["src_schema_norm"],
+        rec["src_table_norm"],
+        rec["src_column_norm"],
+        rec["dst_conn_norm"],
+        rec["dst_schema_norm"],
+        rec["dst_table_norm"],
+        rec["dst_column_norm"]
+    )
+
+    rec["src_dataset_name"] = build_dataset_display_name(
+        rec["src_type"],
+        rec["src_conn_norm"],
+        rec["src_schema_norm"],
+        rec["src_table_norm"]
+    )
+
+    rec["dst_dataset_name"] = build_dataset_display_name(
+        rec["dst_type"],
+        rec["dst_conn_norm"],
+        rec["dst_schema_norm"],
+        rec["dst_table_norm"]
+    )
+
+    rec["src_column_name"] = build_column_display_name(
+        rec["src_type"],
+        rec["src_table_norm"],
+        rec["src_column_norm"]
+    )
+
+    rec["dst_column_name"] = build_column_display_name(
+        rec["dst_type"],
+        rec["dst_table_norm"],
+        rec["dst_column_norm"]
+    )
+
+    rec["process_name"] = build_process_display_name(
+        rec["job_cd"],
+        rec["job_id"]
+    )
+
+    return rec
+
+
+def extract_normalize_enrich_batch():
     last_id = int(
         Variable.get(
             "gca_atlas_last_governance_id",
@@ -215,10 +378,7 @@ def extract_and_normalize_batch():
     LIMIT %s
     """
 
-    records = pg.get_records(
-        sql,
-        parameters=(last_id, BATCH_SIZE)
-    )
+    records = pg.get_records(sql, parameters=(last_id, BATCH_SIZE))
 
     row_count = len(records)
     print(f"Fetched rows in batch: {row_count}")
@@ -228,18 +388,32 @@ def extract_and_normalize_batch():
         return
 
     normalized_records = [normalize_record(row) for row in records]
+    enriched_records = [enrich_with_qualified_names(rec) for rec in normalized_records]
 
-    preview_count = min(3, len(normalized_records))
+    preview_count = min(3, len(enriched_records))
     for i in range(preview_count):
-        print(f"Normalized row {i + 1}: {normalized_records[i]}")
+        rec = enriched_records[i]
+        preview = {
+            "governance_id": rec["governance_id"],
+            "job_id": rec["job_id"],
+            "process_name": rec["process_name"],
+            "src_type": rec["src_type"],
+            "dst_type": rec["dst_type"],
+            "src_dataset_qn": rec["src_dataset_qn"],
+            "src_column_qn": rec["src_column_qn"],
+            "dst_dataset_qn": rec["dst_dataset_qn"],
+            "dst_column_qn": rec["dst_column_qn"],
+            "process_qn": rec["process_qn"]
+        }
+        print(f"Enriched row {i + 1}: {preview}")
 
-    max_governance_id = max(r["governance_id"] for r in normalized_records)
+    max_governance_id = max(r["governance_id"] for r in enriched_records)
     print(f"Max governance_id in batch: {max_governance_id}")
 
     src_type_counts = {}
     dst_type_counts = {}
 
-    for rec in normalized_records:
+    for rec in enriched_records:
         src_type_counts[rec["src_type"]] = src_type_counts.get(rec["src_type"], 0) + 1
         dst_type_counts[rec["dst_type"]] = dst_type_counts.get(rec["dst_type"], 0) + 1
 
@@ -255,84 +429,75 @@ with DAG(
     tags=["GCA", "ATLAS", "GOVERNANCE"]
 ) as dag:
 
-    extract_normalize_batch = PythonOperator(
-        task_id="extract_and_normalize_batch",
-        python_callable=extract_and_normalize_batch
+    extract_normalize_enrich = PythonOperator(
+        task_id="extract_normalize_enrich_batch",
+        python_callable=extract_normalize_enrich_batch
     )
 
-    extract_normalize_batch
+    extract_normalize_enrich
 ```
 
 ---
 
-## What this code does
+## What to expect in logs
 
-### Connection normalization
-
-Examples:
-
-* `HIVE_UAT` → `hive`
-* `CRM_UAT` → `crm`
-* `mostaql_UAT` → `mostaql`
-* `exel_data` → `exel_data`
-
-### Type classification
-
-* no schema and no table → `excel`
-* connection contains `hive` → `hive`
-* otherwise → `rdbms`
-
-### Fallbacks
-
-If some names are missing:
-
-* schema → `default`
-* table → `logical_table`
-* column → `unknown_column`
-
-This matches the design we agreed on.
-
----
-
-## Run the DAG again
-
-After trigger, expected logs will include things like:
+You should now see log output like:
 
 ```text
-Last processed governance_id: 0
-Batch size: 1000
-Fetched rows in batch: 1000
-Normalized row 1: {...}
-Normalized row 2: {...}
-Normalized row 3: {...}
-Max governance_id in batch: ...
-Source type counts: {'hive': 700, 'rdbms': 250, 'excel': 50}
-Destination type counts: {'hive': 1000}
+Enriched row 1: {
+  'governance_id': ...,
+  'job_id': ...,
+  'process_name': 'L_SPRK_...',
+  'src_type': 'hive',
+  'dst_type': 'hive',
+  'src_dataset_qn': 'hive.schema.table@datalikegovernance',
+  'src_column_qn': 'hive.schema.table.column@datalikegovernance',
+  'dst_dataset_qn': 'crm.schema.table@datalikegovernance',
+  'dst_column_qn': 'crm.schema.table.column@datalikegovernance',
+  'process_qn': 'process....@datalikegovernance'
+}
 ```
 
-The numbers will depend on your actual data.
+For Excel-like rows, you should see:
+
+```text
+excel.exel_data.default.logical_table@datalikegovernance
+```
 
 ---
 
-## What I need from you after this step
+## What this step validates
+
+This confirms that:
+
+* naming rules are correct
+* `_UAT` removal works
+* Excel fallback naming works
+* process uniqueness is deterministic
+* all later Atlas entities will be built on stable IDs
+
+---
+
+## After this step
 
 Reply with:
 
-* **Step 4 done**
-* and tell me whether the classification looks reasonable:
+**Step 5 done**
 
-  * are Excel rows detected correctly?
-  * are Hive rows detected correctly?
-  * any obvious wrong classification?
+and tell me if:
 
-After that I will move to:
+* the qualified names look correct
+* Excel rows are getting `excel.{conn}.default.logical_table...`
+* any name looks wrong
 
-## Step 5 — Build final Atlas qualified names
+Then I will give you:
 
-In that step we will generate:
+## Step 6 — Build Atlas entity JSON payloads
 
-* `gca_dataset` qualified names
-* `gca_column` qualified names
-* `Process` qualified names
+That step will create the actual JSON structures for:
 
-That is the key step before Atlas payload creation.
+* `gca_dataset`
+* `gca_column`
+* `Process`
+
+before we connect to Atlas.
