@@ -1,34 +1,25 @@
-Good. Now we do the **first live Atlas push**, but only for a **tiny safe batch of 5 rows**.
+Good. Next is the production step.
 
-Atlas supports bulk entity create/update through `/v2/entity/bulk`, and Airflow 3 recommends using `Variable` from `airflow.sdk`. ([atlas.apache.org][1])
+Airflow Variables are suitable for this global checkpoint state, and in Airflow 3 the runtime import is `from airflow.sdk import Variable`. Atlas supports bulk entity upsert through `/api/atlas/v2/entity/bulk`, which is what we’ll keep using for datasets, columns, and processes. ([Apache Airflow][1])
 
-## Step 11 — Push 5 test rows from Airflow to Atlas
+## Step 12 — Make it production: real batch + watermark update only on success
 
-### 1) Create these Airflow Variables
+### What changes now
 
-Add these in **Admin → Variables**:
+* batch size goes back to `1000`
+* if all 3 Atlas bulk pushes succeed:
 
-* `gca_atlas_url` = your direct Atlas URL, for example `http://atlas-host:21000`
-* `gca_atlas_kerberos_principal` = your Kerberos principal
-* `gca_atlas_keytab_path` = full path to the keytab the Airflow worker can read
+  * update `gca_atlas_last_governance_id`
+* if any push fails:
 
-This keeps the DAG cleaner and lets you change endpoints without editing code. Airflow Variables are meant for global runtime configuration like this. ([Apache Airflow][2])
+  * do **not** update the watermark
+* next run resumes from the last successful id
+
+That gives you safe incremental processing. ([Apache Airflow][1])
 
 ---
 
-### 2) Replace your DAG with this version
-
-This version:
-
-* does `kinit -kt`
-* reads only 5 rows
-* builds `gca_dataset`, `gca_column`, `gca_process`
-* pushes them to Atlas in 3 separate bulk calls:
-
-  * datasets first
-  * columns second
-  * processes third
-* does **not** update the watermark yet
+## Replace your DAG with this version
 
 ```python
 from datetime import datetime
@@ -44,7 +35,7 @@ from airflow.sdk import Variable
 
 DAG_NAME = "gca_governance_to_atlas"
 POSTGRES_CONN_ID = "datalike_db"
-BATCH_SIZE = 5
+BATCH_SIZE = 1000
 QN_NAMESPACE = "@datalikegovernance"
 
 
@@ -305,7 +296,7 @@ def build_process_entity(rec):
     }
 
 
-def atlas_bulk_push(atlas_url, entities):
+def atlas_bulk_push(atlas_url, entities, label):
     payload = {"entities": entities}
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=True) as f:
@@ -324,12 +315,12 @@ def atlas_bulk_push(atlas_url, entities):
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-    print("curl return code:", result.returncode)
-    print("curl stdout:", result.stdout[:4000])
-    print("curl stderr:", result.stderr[:4000])
+    print(f"{label} curl return code: {result.returncode}")
+    print(f"{label} curl stdout: {result.stdout[:4000]}")
+    print(f"{label} curl stderr: {result.stderr[:4000]}")
 
     if result.returncode != 0:
-        raise RuntimeError(f"Atlas bulk push failed: {result.stderr}")
+        raise RuntimeError(f"{label} bulk push failed: {result.stderr}")
 
 
 def kinit_with_keytab(principal, keytab_path):
@@ -344,7 +335,7 @@ def kinit_with_keytab(principal, keytab_path):
         raise RuntimeError(f"kinit failed: {result.stderr}")
 
 
-def push_test_batch_to_atlas():
+def process_batch_to_atlas():
     atlas_url = Variable.get("gca_atlas_url")
     kerberos_principal = Variable.get("gca_atlas_kerberos_principal")
     keytab_path = Variable.get("gca_atlas_keytab_path")
@@ -352,7 +343,7 @@ def push_test_batch_to_atlas():
 
     print(f"Atlas URL: {atlas_url}")
     print(f"Last processed governance_id: {last_id}")
-    print(f"Test batch size: {BATCH_SIZE}")
+    print(f"Production batch size: {BATCH_SIZE}")
 
     kinit_with_keytab(kerberos_principal, keytab_path)
 
@@ -386,7 +377,7 @@ def push_test_batch_to_atlas():
 
     records = pg.get_records(sql, parameters=(last_id, BATCH_SIZE))
     if not records:
-        print("No rows to push.")
+        print("No rows to process.")
         return
 
     normalized_records = [normalize_record(row) for row in records]
@@ -423,12 +414,13 @@ def push_test_batch_to_atlas():
     print(f"Columns to push: {len(column_entities)}")
     print(f"Processes to push: {len(process_entities)}")
 
-    atlas_bulk_push(atlas_url, list(dataset_entities.values()))
-    atlas_bulk_push(atlas_url, list(column_entities.values()))
-    atlas_bulk_push(atlas_url, list(process_entities.values()))
+    atlas_bulk_push(atlas_url, list(dataset_entities.values()), "DATASETS")
+    atlas_bulk_push(atlas_url, list(column_entities.values()), "COLUMNS")
+    atlas_bulk_push(atlas_url, list(process_entities.values()), "PROCESSES")
 
     max_governance_id = max(r["governance_id"] for r in enriched_records)
-    print(f"Test push finished successfully. Max governance_id in test batch: {max_governance_id}")
+    Variable.set("gca_atlas_last_governance_id", str(max_governance_id))
+    print(f"Watermark updated successfully to: {max_governance_id}")
 
 
 with DAG(
@@ -439,73 +431,58 @@ with DAG(
     tags=["GCA", "ATLAS", "GOVERNANCE"],
 ) as dag:
 
-    push_test_batch = PythonOperator(
-        task_id="push_test_batch_to_atlas",
-        python_callable=push_test_batch_to_atlas,
+    process_batch = PythonOperator(
+        task_id="process_batch_to_atlas",
+        python_callable=process_batch_to_atlas,
     )
 
-    push_test_batch
+    process_batch
 ```
 
 ---
 
-### 3) Run the DAG once
+## What to do now
 
-Trigger it manually.
+Run the DAG manually once.
 
-### Expected success shape
+### Expected success log
 
-You should see logs like:
+You should see:
 
 * `kinit return code: 0`
 * `Datasets to push: ...`
 * `Columns to push: ...`
 * `Processes to push: ...`
-* `curl return code: 0`
-* Atlas JSON response in stdout
-* `Test push finished successfully...`
+* `DATASETS curl return code: 0`
+* `COLUMNS curl return code: 0`
+* `PROCESSES curl return code: 0`
+* `Watermark updated successfully to: ...`
 
-Atlas’s REST API documents both type-definition endpoints and the bulk entity endpoint we are using here. ([atlas.apache.org][1])
-
-### Important
-
-This step still does **not** update `gca_atlas_last_governance_id`.
-We first confirm Atlas write works cleanly.
+If the Atlas write fails at any stage, the function raises an exception and the Variable is **not** updated, which preserves safe restart behavior. ([Apache Airflow][1])
 
 ---
 
-### 4) If it fails
+## After one successful run
 
-Send me the exact error from:
+Check the Variable:
 
-* `kinit stderr`
-* or `curl stdout/stderr`
+* `gca_atlas_last_governance_id`
 
-Most likely failures will be:
+It should now be greater than `0`.
 
-* keytab permission problem
-* wrong principal
-* Atlas rejecting relationship attributes
-* Atlas type mismatch
+Then trigger again and confirm it continues from the new id.
 
 ---
 
-### 5) After it succeeds
+## Next production step after this
 
-Check Atlas UI and search for one of:
+Once this works, the final cleanup is:
 
-* `gca_dataset`
-* `gca_column`
-* `gca_process`
-* or one exact `qualifiedName`
+* add retries on the task
+* set a schedule, such as every 10 minutes
+* optionally loop through multiple batches in one DAG run instead of one batch per trigger
+* optionally split code into helper modules for cleaner maintenance
 
-Then tell me:
+If this run fails, paste the exact `curl stdout/stderr` or `kinit stderr`.
 
-* `Step 11 done - push succeeded`
-* or paste the error
-
-After that, I’ll give you the production step to:
-**update the watermark only after successful push and switch from test batch to real batch processing**.
-
-[1]: https://atlas.apache.org/api/v2/index.html?utm_source=chatgpt.com "Atlas REST API"
-[2]: https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/variables.html?utm_source=chatgpt.com "Variables — Airflow 3.1.8 Documentation"
+[1]: https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/variables.html?utm_source=chatgpt.com "Variables — Airflow 3.1.8 Documentation"
