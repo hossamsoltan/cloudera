@@ -1,81 +1,30 @@
-Below is the **final professional design and DAG** for your case.
+Yes. The clean native model for your case is:
 
-It does this:
+* **one `spark_application` per job**
+* **one `spark_process` per governance row / transformation**
+* **one `spark_column_lineage` per governance row** for column-to-column lineage
+* **reuse native `hive_db` / `hive_table` / `hive_column`** for targets
+* **treat all non-Hive sources as `rdbms_table` / `rdbms_column`**
+* **auto-create missing source-side RDBMS entities**
+* **fallback source schema/table from source connection**
+* **unknown target layer gets `temp_` prefix**
+* preserve your business metadata using a native Atlas **classification**
 
-* reads governance metadata from **PostgreSQL**
-* treats every `job_cd` as a **real Spark job**
-* reuses existing native Atlas **Hive entities**
+That matches Cloudera’s native Spark lineage model: Atlas uses a `spark_application` for the job, one or more `spark_process` entities for executions in that job, and native lineage is built from input/output relationships. Cloudera also documents native `spark_column_lineage` entities with input columns, output column, and a relationship to the producing `spark_process`. ([Cloudera Docs][1])
 
-  * `hive_db`
-  * `hive_table`
-  * `hive_column`
-* reuses existing native Atlas **source entities** for mixed source systems
-* creates native **`spark_application`** and **`spark_process`** lineage
-* preserves your governance metadata on the process through a native Atlas **classification**
-* uses `@data_like` for the new Spark application/process qualified names
-* updates `gca_atlas_last_governance_id` incrementally
+## What you need to do
 
-This is the cleanest way to stay **native** and still keep your business metadata.
-
----
-
-# 1. What this DAG expects
-
-Before running it, these things must already be true.
-
-## Atlas side
-
-Your target Hive objects already exist in Atlas natively, which your screenshots confirmed.
-
-Examples from your cluster:
-
-* Hive DB QN:
-
-  * `slv_hasib@cm`
-* Hive table QN:
-
-  * `brz_itsm.changehistory@cm`
-* Hive column QN:
-
-  * `brz_itsm.changehistory.historyid@cm`
-
-Your Spark native type exists too:
-
-* `spark_process`
-
-## Source side
-
-For each non-Hive source connection, Atlas must already contain the native source entities you want to reference.
-
-This DAG does **not** create fake source entities.
-It **references existing native source assets** using mapping templates you configure once.
-
-That is the professional behavior.
-
----
-
-# 2. Airflow variables required
-
-Create or keep these variables:
-
-```text
-gca_atlas_last_governance_id
-gca_atlas_url
-gca_atlas_kerberos_principal
-gca_atlas_kerberos_keytab
-```
-
-For first full load:
+Create these Airflow Variables:
 
 ```text
 gca_atlas_last_governance_id = 0
+gca_atlas_url = https://<your-knox-or-atlas-url>
+gca_atlas_kerberos_principal = <your-principal>
+gca_atlas_kerberos_keytab = <full-keytab-path>
+gca_atlas_source_connection_map = {"HIVE_UAT":"hive","csv_lookup_files":"file","default":"rdbms"}
 ```
 
----
-
-# 3. PostgreSQL indexes
-
-Run these once:
+Run these indexes once:
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_dlg_governance_id
@@ -88,61 +37,17 @@ CREATE INDEX IF NOT EXISTS idx_dtj_job_id
     ON public.data_transfer_job (job_id);
 ```
 
----
-
-# 4. Source mapping you must fill once
-
-Because your sources are mixed, the DAG uses a config section to resolve the native Atlas qualified names for each source system.
-
-You must fill the mapping for each connection code.
-
-Examples:
-
-* `mostaql`
-* `etimad`
-* `excel_data`
-* `excel_sheet`
-* any other source connection
-
-If a source is already Hive, the DAG automatically uses native Hive QNs.
-
-If a source is non-Hive, the DAG uses the mapping template you define.
-
----
-
-# 5. What metadata is preserved
-
-The DAG creates a native Atlas classification called:
-
-```text
-data_like_governance_meta
-```
-
-and applies it to every new Spark application and Spark process with these attributes:
-
-* `job_cd`
-* `job_id`
-* `sql_query`
-* `source_connection`
-* `destination_connection`
-* `governance_id`
-* `create_timestamp`
-* `layer_from`
-* `layer_to`
-
-This keeps your business/governance metadata without breaking native Atlas entities.
-
----
-
-# 6. Final Airflow DAG
-
-Save this file as:
+Put the DAG below in your Airflow DAGs folder as:
 
 ```text
 gca_atlas_native_spark_lineage_final.py
 ```
 
-Put it in your Airflow DAGs folder.
+Run it manually first. After validation, add a schedule.
+
+---
+
+## Final DAG
 
 ```python
 import json
@@ -151,7 +56,6 @@ import os
 import re
 import subprocess
 import tempfile
-from collections import defaultdict
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -161,7 +65,7 @@ from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # ============================================================
-# Configuration
+# Config
 # ============================================================
 
 DAG_ID = "gca_atlas_native_spark_lineage_final"
@@ -171,6 +75,7 @@ ATLAS_LAST_GOV_ID_VAR = "gca_atlas_last_governance_id"
 ATLAS_URL_VAR = "gca_atlas_url"
 ATLAS_KRB_PRINCIPAL_VAR = "gca_atlas_kerberos_principal"
 ATLAS_KRB_KEYTAB_VAR = "gca_atlas_kerberos_keytab"
+ATLAS_SOURCE_CONN_MAP_VAR = "gca_atlas_source_connection_map"
 
 DB_FETCH_BATCH_SIZE = 2000
 ATLAS_PUSH_CHUNK_SIZE = 200
@@ -179,62 +84,19 @@ PROCESS_LOOP_MAX_BATCHES_PER_RUN = 1000
 
 CLUSTER_NAME = "cm"
 GOV_CLASSIFICATION_NAME = "data_like_governance_meta"
-
-# ============================================================
-# Source-system native Atlas mapping
-# Fill this section carefully for every non-Hive source system.
-# ============================================================
-#
-# table_qn_template and column_qn_template must match the REAL
-# native Atlas qualifiedName pattern already present in your Atlas.
-#
-# Examples below are placeholders. Replace them with your real ones.
-#
-SOURCE_SYSTEM_MAP = {
-    # Example relational source
-    "mostaql": {
-        "table_type": "rdbms_table",
-        "column_type": "rdbms_column",
-        "table_qn_template": "{schema}.{table}@cm",              # CHANGE THIS if your Atlas uses a different QN
-        "column_qn_template": "{schema}.{table}.{column}@cm",   # CHANGE THIS if your Atlas uses a different QN
-    },
-    "etimad": {
-        "table_type": "rdbms_table",
-        "column_type": "rdbms_column",
-        "table_qn_template": "{schema}.{table}@cm",              # CHANGE THIS
-        "column_qn_template": "{schema}.{table}.{column}@cm",   # CHANGE THIS
-    },
-    # Example Excel modeled through native existing entities in Atlas
-    "excel_data": {
-        "table_type": "rdbms_table",
-        "column_type": "rdbms_column",
-        "table_qn_template": "{schema}.{table}@cm",              # CHANGE THIS
-        "column_qn_template": "{schema}.{table}.{column}@cm",   # CHANGE THIS
-    },
-    "excel_sheet": {
-        "table_type": "rdbms_table",
-        "column_type": "rdbms_column",
-        "table_qn_template": "{schema}.{table}@cm",              # CHANGE THIS
-        "column_qn_template": "{schema}.{table}.{column}@cm",   # CHANGE THIS
-    },
-    # If you have a Hive source connection, you do NOT need a mapping here.
-}
-
-# ============================================================
-# Logging
-# ============================================================
+MEDALLION_PREFIXES = ("stg", "brz", "slv", "gld")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # ============================================================
-# Helpers
+# Runtime / shell helpers
 # ============================================================
 
 def _require_var(name: str) -> str:
     value = Variable.get(name, default_var=None)
     if value is None or str(value).strip() == "":
-        raise AirflowException(f"Required Airflow Variable '{name}' is missing or empty")
+        raise AirflowException(f"Missing Airflow Variable: {name}")
     return str(value).strip()
 
 
@@ -247,10 +109,10 @@ def _runtime_config() -> dict:
     try:
         last_id = int(str(last_raw).strip())
     except Exception as exc:
-        raise AirflowException(f"Invalid value for {ATLAS_LAST_GOV_ID_VAR}: {last_raw}") from exc
+        raise AirflowException(f"Invalid {ATLAS_LAST_GOV_ID_VAR}: {last_raw}") from exc
 
     if not os.path.exists(keytab):
-        raise AirflowException(f"Kerberos keytab not found: {keytab}")
+        raise AirflowException(f"Keytab not found: {keytab}")
 
     return {
         "atlas_url": atlas_url,
@@ -273,7 +135,6 @@ def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
         logger.info("stdout: %s", result.stdout.strip())
     if result.stderr.strip():
         logger.warning("stderr: %s", result.stderr.strip())
-
     if check and result.returncode != 0:
         raise AirflowException(
             f"Command failed ({result.returncode}): {' '.join(cmd)}\n"
@@ -317,7 +178,7 @@ def _curl_atlas_json(atlas_url: str, endpoint: str, method: str = "GET", payload
         result = _run_cmd(cmd, check=False)
 
         if "__HTTP_STATUS__:" not in result.stdout:
-            raise AirflowException(f"Unable to parse Atlas HTTP response for {url}")
+            raise AirflowException(f"Invalid Atlas response from {url}")
 
         body, status_str = result.stdout.rsplit("__HTTP_STATUS__:", 1)
         status_code = int(status_str.strip())
@@ -340,6 +201,9 @@ def _curl_atlas_json(atlas_url: str, endpoint: str, method: str = "GET", payload
         if temp_file and os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
 
+# ============================================================
+# String helpers
+# ============================================================
 
 def _safe_lower(v: str | None) -> str:
     return (v or "").strip().lower()
@@ -353,48 +217,76 @@ def _normalize_identifier(v: str | None) -> str:
     return s
 
 
-def _normalize_connection_name(v: str | None) -> str:
-    s = _normalize_identifier(v)
-    s = re.sub(r"(^|_)(uat)($|_)", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "unknown_conn"
+def _normalize_conn(v: str | None) -> str:
+    return _normalize_identifier(v) or "unknown_conn"
 
 
 def _normalize_schema(v: str | None, fallback: str = "unknown_schema") -> str:
-    s = _normalize_identifier(v)
-    return s or fallback
+    return _normalize_identifier(v) or fallback
 
 
 def _normalize_table(v: str | None, fallback: str = "unknown_table") -> str:
-    s = _normalize_identifier(v)
-    return s or fallback
+    return _normalize_identifier(v) or fallback
 
 
 def _normalize_column(v: str | None, fallback: str = "unknown_column") -> str:
-    s = _normalize_identifier(v)
-    return s or fallback
+    return _normalize_identifier(v) or fallback
 
 
 def _detect_layer(schema_name: str) -> str:
     s = _safe_lower(schema_name)
+    if s.startswith("stg"):
+        return "staging"
     if s.startswith("brz"):
         return "bronze"
     if s.startswith("slv"):
         return "silver"
     if s.startswith("gld"):
         return "gold"
+    if s.startswith("temp_"):
+        return "temporary"
     return "source"
 
 
-def _is_hive_schema(schema_name: str) -> bool:
-    s = _safe_lower(schema_name)
-    return s.startswith("brz") or s.startswith("slv") or s.startswith("gld")
+def _normalize_dest_schema(dst_schema: str | None) -> str:
+    s = _normalize_schema(dst_schema, fallback="temp_unknown")
+    if not s.startswith(MEDALLION_PREFIXES) and not s.startswith("temp_"):
+        s = f"temp_{s}"
+    return s
 
 
-def _is_hive_connection(conn_name: str) -> bool:
-    c = _safe_lower(conn_name)
-    return "hive" in c or c == "spark" or c == "hms"
+def _get_source_system(conn_name: str) -> str:
+    raw = Variable.get(ATLAS_SOURCE_CONN_MAP_VAR, default_var='{"default":"rdbms"}')
+    try:
+        mapping = json.loads(raw)
+    except Exception:
+        mapping = {"default": "rdbms"}
 
+    original = (conn_name or "").strip()
+    normalized = _normalize_conn(conn_name)
+
+    if original in mapping:
+        return str(mapping[original]).strip().lower()
+    if normalized in mapping:
+        return str(mapping[normalized]).strip().lower()
+
+    return str(mapping.get("default", "rdbms")).strip().lower()
+
+
+def _source_defaults_from_conn(src_conn: str, src_schema: str | None, src_table: str | None, src_column: str | None) -> tuple[str, str, str]:
+    """
+    If source schema/table are missing, derive them from source connection.
+    This is the simple behavior you requested for excel-like sources.
+    """
+    conn_base = _normalize_conn(src_conn)
+    schema = _normalize_schema(src_schema, fallback=conn_base)
+    table = _normalize_table(src_table, fallback=conn_base)
+    column = _normalize_column(src_column, fallback="nosource_column")
+    return schema, table, column
+
+# ============================================================
+# Native qualified names
+# ============================================================
 
 def _hive_db_qn(db_name: str) -> str:
     return f"{db_name}@{CLUSTER_NAME}"
@@ -408,65 +300,31 @@ def _hive_column_qn(db_name: str, table_name: str, column_name: str) -> str:
     return f"{db_name}.{table_name}.{column_name}@{CLUSTER_NAME}"
 
 
+def _rdbms_table_qn(conn_name: str, schema_name: str, table_name: str) -> str:
+    return f"{conn_name}.{schema_name}.{table_name}@data_like"
+
+
+def _rdbms_column_qn(conn_name: str, schema_name: str, table_name: str, column_name: str) -> str:
+    return f"{conn_name}.{schema_name}.{table_name}.{column_name}@data_like"
+
+
 def _spark_app_qn(job_cd: str, job_id: int) -> str:
     return f"spark_app.{_normalize_identifier(job_cd)}.{job_id}@data_like"
 
 
-def _spark_process_table_qn(job_cd: str, job_id: int, src_table_qn: str, dst_table_qn: str) -> str:
-    return (
-        f"spark_process.table."
-        f"{_normalize_identifier(job_cd)}.{job_id}."
-        f"{_normalize_identifier(src_table_qn)}."
-        f"{_normalize_identifier(dst_table_qn)}@data_like"
-    )
+def _spark_proc_qn(job_cd: str, governance_id: int) -> str:
+    return f"spark_proc.{_normalize_identifier(job_cd)}.{governance_id}@data_like"
 
 
-def _spark_process_column_qn(job_cd: str, governance_id: int, src_col_qn: str, dst_col_qn: str) -> str:
-    return (
-        f"spark_process.column."
-        f"{_normalize_identifier(job_cd)}.{governance_id}."
-        f"{_normalize_identifier(src_col_qn)}."
-        f"{_normalize_identifier(dst_col_qn)}@data_like"
-    )
-
-
-def _classification_payload(
-    job_cd: str,
-    job_id: int,
-    sql_query: str,
-    src_conn: str,
-    dst_conn: str,
-    governance_id: int | None,
-    create_timestamp: str | None,
-    layer_from: str,
-    layer_to: str,
-) -> list[dict]:
-    return [
-        {
-            "typeName": GOV_CLASSIFICATION_NAME,
-            "attributes": {
-                "job_cd": str(job_cd or ""),
-                "job_id": str(job_id),
-                "sql_query": str(sql_query or ""),
-                "source_connection": str(src_conn or ""),
-                "destination_connection": str(dst_conn or ""),
-                "governance_id": "" if governance_id is None else str(governance_id),
-                "create_timestamp": str(create_timestamp or ""),
-                "layer_from": str(layer_from or ""),
-                "layer_to": str(layer_to or ""),
-            },
-        }
-    ]
+def _spark_col_lineage_qn(job_cd: str, governance_id: int) -> str:
+    return f"spark_col_lineage.{_normalize_identifier(job_cd)}.{governance_id}@data_like"
 
 
 def _entity_ref(type_name: str, qualified_name: str) -> dict:
     return {
         "typeName": type_name,
-        "uniqueAttributes": {
-            "qualifiedName": qualified_name
-        }
+        "uniqueAttributes": {"qualifiedName": qualified_name}
     }
-
 
 # ============================================================
 # Atlas bootstrap
@@ -482,7 +340,6 @@ def _type_exists(atlas_url: str, type_name: str) -> bool:
 
 def _ensure_governance_classification(atlas_url: str) -> None:
     if _type_exists(atlas_url, GOV_CLASSIFICATION_NAME):
-        logger.info("Classification %s already exists", GOV_CLASSIFICATION_NAME)
         return
 
     payload = {
@@ -490,7 +347,7 @@ def _ensure_governance_classification(atlas_url: str) -> None:
             {
                 "category": "CLASSIFICATION",
                 "name": GOV_CLASSIFICATION_NAME,
-                "description": "Business metadata from Data Like governance tables",
+                "description": "Business metadata from governance tables",
                 "typeVersion": "1.0",
                 "attributeDefs": [
                     {"name": "job_cd", "typeName": "string", "isOptional": True, "cardinality": "SINGLE", "isUnique": False, "isIndexable": True},
@@ -506,19 +363,16 @@ def _ensure_governance_classification(atlas_url: str) -> None:
             }
         ]
     }
-
     _curl_atlas_json(atlas_url, "/api/atlas/v2/types/typedefs", "POST", payload)
-    logger.info("Created classification %s", GOV_CLASSIFICATION_NAME)
 
 
-def _entity_exists_by_qn(atlas_url: str, type_name: str, qualified_name: str) -> bool:
+def _entity_exists(atlas_url: str, type_name: str, qualified_name: str) -> bool:
     endpoint = f"/api/atlas/v2/entity/uniqueAttribute/type/{type_name}?attr:qualifiedName={qualified_name}"
     try:
         _curl_atlas_json(atlas_url, endpoint, "GET")
         return True
     except Exception:
         return False
-
 
 # ============================================================
 # PostgreSQL
@@ -593,80 +447,88 @@ def _fetch_job_metadata(job_ids: list[int]) -> dict[int, dict]:
         for r in records
     }
 
-
 # ============================================================
 # Source / target resolution
 # ============================================================
 
-def _resolve_source_native_ref(
+def _bulk_upsert(atlas_url: str, entities: list[dict]) -> None:
+    if not entities:
+        return
+    _curl_atlas_json(atlas_url, "/api/atlas/v2/entity/bulk", "POST", {"entities": entities})
+
+
+def _create_rdbms_source_if_missing(
+    atlas_url: str,
+    table_qn: str,
+    column_qn: str,
+    table_name: str,
+    column_name: str,
+) -> None:
+    entities = []
+
+    if not _entity_exists(atlas_url, "rdbms_table", table_qn):
+        entities.append({
+            "typeName": "rdbms_table",
+            "attributes": {
+                "qualifiedName": table_qn,
+                "name": table_name,
+                "owner": "data_like"
+            }
+        })
+
+    if not _entity_exists(atlas_url, "rdbms_column", column_qn):
+        entities.append({
+            "typeName": "rdbms_column",
+            "attributes": {
+                "qualifiedName": column_qn,
+                "name": column_name,
+                "owner": "data_like"
+            }
+        })
+
+    if entities:
+        _bulk_upsert(atlas_url, entities)
+
+
+def _resolve_source_ref(
     atlas_url: str,
     src_conn: str,
-    src_schema: str,
-    src_table: str,
-    src_column: str,
-) -> tuple[dict, dict]:
+    src_schema: str | None,
+    src_table: str | None,
+    src_column: str | None,
+) -> tuple[dict | None, dict | None]:
     """
-    Returns:
-      source_table_ref, source_column_ref
+    Simple behavior:
+    - hive source -> reuse native hive entities
+    - anything else -> create/reuse rdbms source entities
+    - if schema/table missing -> derive from source connection
+    """
+    system_type = _get_source_system(src_conn)
+    src_schema, src_table, src_column = _source_defaults_from_conn(src_conn, src_schema, src_table, src_column)
 
-    Professional rule:
-      - If source is Hive-like, reuse native hive_* entities.
-      - Else use SOURCE_SYSTEM_MAP to resolve native existing source entities.
-      - Fail if mapping is missing or entity does not exist.
-    """
-    if _is_hive_schema(src_schema) or _is_hive_connection(src_conn):
+    if system_type == "hive":
         table_qn = _hive_table_qn(src_schema, src_table)
         column_qn = _hive_column_qn(src_schema, src_table, src_column)
 
-        if not _entity_exists_by_qn(atlas_url, "hive_table", table_qn):
-            raise AirflowException(f"Native source hive_table not found in Atlas: {table_qn}")
-        if not _entity_exists_by_qn(atlas_url, "hive_column", column_qn):
-            raise AirflowException(f"Native source hive_column not found in Atlas: {column_qn}")
+        if not _entity_exists(atlas_url, "hive_table", table_qn):
+            return None, None
+        if not _entity_exists(atlas_url, "hive_column", column_qn):
+            return None, None
 
-        return (
-            _entity_ref("hive_table", table_qn),
-            _entity_ref("hive_column", column_qn),
-        )
+        return _entity_ref("hive_table", table_qn), _entity_ref("hive_column", column_qn)
 
-    source_cfg = SOURCE_SYSTEM_MAP.get(src_conn)
-    if not source_cfg:
-        raise AirflowException(
-            f"No SOURCE_SYSTEM_MAP entry found for source connection '{src_conn}'. "
-            f"Add its native Atlas mapping before running."
-        )
+    table_qn = _rdbms_table_qn(src_conn, src_schema, src_table)
+    column_qn = _rdbms_column_qn(src_conn, src_schema, src_table, src_column)
 
-    table_qn = source_cfg["table_qn_template"].format(
-        conn=src_conn,
-        schema=src_schema,
-        table=src_table,
-        column=src_column,
-        cluster=CLUSTER_NAME,
-    )
-    column_qn = source_cfg["column_qn_template"].format(
-        conn=src_conn,
-        schema=src_schema,
-        table=src_table,
-        column=src_column,
-        cluster=CLUSTER_NAME,
+    _create_rdbms_source_if_missing(
+        atlas_url=atlas_url,
+        table_qn=table_qn,
+        column_qn=column_qn,
+        table_name=src_table,
+        column_name=src_column,
     )
 
-    table_type = source_cfg["table_type"]
-    column_type = source_cfg["column_type"]
-
-    if not _entity_exists_by_qn(atlas_url, table_type, table_qn):
-        raise AirflowException(
-            f"Native source table not found in Atlas: type={table_type}, qualifiedName={table_qn}"
-        )
-
-    if not _entity_exists_by_qn(atlas_url, column_type, column_qn):
-        raise AirflowException(
-            f"Native source column not found in Atlas: type={column_type}, qualifiedName={column_qn}"
-        )
-
-    return (
-        _entity_ref(table_type, table_qn),
-        _entity_ref(column_type, column_qn),
-    )
+    return _entity_ref("rdbms_table", table_qn), _entity_ref("rdbms_column", column_qn)
 
 
 def _resolve_target_hive_ref(
@@ -674,36 +536,64 @@ def _resolve_target_hive_ref(
     dst_schema: str,
     dst_table: str,
     dst_column: str,
-) -> tuple[dict, dict]:
+) -> tuple[dict | None, dict | None]:
+    dst_schema = _normalize_dest_schema(dst_schema)
+    dst_table = _normalize_table(dst_table)
+    dst_column = _normalize_column(dst_column)
+
+    db_qn = _hive_db_qn(dst_schema)
     table_qn = _hive_table_qn(dst_schema, dst_table)
     column_qn = _hive_column_qn(dst_schema, dst_table, dst_column)
 
-    if not _entity_exists_by_qn(atlas_url, "hive_table", table_qn):
-        raise AirflowException(f"Target hive_table not found in Atlas: {table_qn}")
+    if not _entity_exists(atlas_url, "hive_db", db_qn):
+        return None, None
+    if not _entity_exists(atlas_url, "hive_table", table_qn):
+        return None, None
+    if not _entity_exists(atlas_url, "hive_column", column_qn):
+        return None, None
 
-    if not _entity_exists_by_qn(atlas_url, "hive_column", column_qn):
-        raise AirflowException(f"Target hive_column not found in Atlas: {column_qn}")
-
-    return (
-        _entity_ref("hive_table", table_qn),
-        _entity_ref("hive_column", column_qn),
-    )
-
+    return _entity_ref("hive_table", table_qn), _entity_ref("hive_column", column_qn)
 
 # ============================================================
-# Atlas entity builders
+# Entity builders
 # ============================================================
 
-def _build_spark_application_entity(job_cd: str, job_id: int, sql_query: str, src_conn: str, dst_conn: str, layer_from: str, layer_to: str) -> dict:
-    app_qn = _spark_app_qn(job_cd, job_id)
+def _gov_classification(
+    job_cd: str,
+    job_id: int,
+    sql_query: str,
+    src_conn: str,
+    dst_conn: str,
+    governance_id: int | None,
+    create_timestamp: str | None,
+    layer_from: str,
+    layer_to: str,
+) -> list[dict]:
+    return [{
+        "typeName": GOV_CLASSIFICATION_NAME,
+        "attributes": {
+            "job_cd": str(job_cd or ""),
+            "job_id": str(job_id),
+            "sql_query": str(sql_query or ""),
+            "source_connection": str(src_conn or ""),
+            "destination_connection": str(dst_conn or ""),
+            "governance_id": "" if governance_id is None else str(governance_id),
+            "create_timestamp": str(create_timestamp or ""),
+            "layer_from": str(layer_from or ""),
+            "layer_to": str(layer_to or ""),
+        }
+    }]
+
+
+def _build_spark_application(job_cd: str, job_id: int, sql_query: str, src_conn: str, dst_conn: str, layer_from: str, layer_to: str) -> dict:
     return {
         "typeName": "spark_application",
         "attributes": {
-            "qualifiedName": app_qn,
+            "qualifiedName": _spark_app_qn(job_cd, job_id),
             "name": str(job_cd),
             "applicationId": str(job_cd),
         },
-        "classifications": _classification_payload(
+        "classifications": _gov_classification(
             job_cd=job_cd,
             job_id=job_id,
             sql_query=sql_query,
@@ -717,9 +607,10 @@ def _build_spark_application_entity(job_cd: str, job_id: int, sql_query: str, sr
     }
 
 
-def _build_table_spark_process_entity(
+def _build_spark_process(
     job_cd: str,
     job_id: int,
+    governance_id: int,
     sql_query: str,
     src_conn: str,
     dst_conn: str,
@@ -727,32 +618,26 @@ def _build_table_spark_process_entity(
     dst_table_ref: dict,
     layer_from: str,
     layer_to: str,
-    governance_min_id: int,
-    governance_max_id: int,
 ) -> dict:
-    src_table_qn = src_table_ref["uniqueAttributes"]["qualifiedName"]
-    dst_table_qn = dst_table_ref["uniqueAttributes"]["qualifiedName"]
-    app_qn = _spark_app_qn(job_cd, job_id)
-
     return {
         "typeName": "spark_process",
         "attributes": {
-            "qualifiedName": _spark_process_table_qn(job_cd, job_id, src_table_qn, dst_table_qn),
-            "name": str(job_cd),
+            "qualifiedName": _spark_proc_qn(job_cd, governance_id),
+            "name": f"{job_cd}:{governance_id}",
             "description": str(sql_query or ""),
         },
         "relationshipAttributes": {
-            "application": _entity_ref("spark_application", app_qn),
+            "application": _entity_ref("spark_application", _spark_app_qn(job_cd, job_id)),
             "inputs": [src_table_ref],
             "outputs": [dst_table_ref],
         },
-        "classifications": _classification_payload(
+        "classifications": _gov_classification(
             job_cd=job_cd,
             job_id=job_id,
             sql_query=sql_query,
             src_conn=src_conn,
             dst_conn=dst_conn,
-            governance_id=governance_min_id if governance_min_id == governance_max_id else governance_max_id,
+            governance_id=governance_id,
             create_timestamp=None,
             layer_from=layer_from,
             layer_to=layer_to,
@@ -760,7 +645,7 @@ def _build_table_spark_process_entity(
     }
 
 
-def _build_column_spark_process_entity(
+def _build_spark_column_lineage(
     job_cd: str,
     job_id: int,
     governance_id: int,
@@ -770,26 +655,30 @@ def _build_column_spark_process_entity(
     dst_conn: str,
     src_column_ref: dict,
     dst_column_ref: dict,
+    process_qn: str,
     layer_from: str,
     layer_to: str,
 ) -> dict:
-    src_col_qn = src_column_ref["uniqueAttributes"]["qualifiedName"]
-    dst_col_qn = dst_column_ref["uniqueAttributes"]["qualifiedName"]
-    app_qn = _spark_app_qn(job_cd, job_id)
+    """
+    Native Atlas type per Cloudera docs:
+      typeName = spark_column_lineage
+      relationships: process, inputs, outputs
 
+    If your cluster uses a different relationship key than 'process',
+    change only that key here.
+    """
     return {
-        "typeName": "spark_process",
+        "typeName": "spark_column_lineage",
         "attributes": {
-            "qualifiedName": _spark_process_column_qn(job_cd, governance_id, src_col_qn, dst_col_qn),
-            "name": f"{job_cd}:{governance_id}",
-            "description": str(sql_query or ""),
+            "qualifiedName": _spark_col_lineage_qn(job_cd, governance_id),
+            "name": _spark_col_lineage_qn(job_cd, governance_id),
         },
         "relationshipAttributes": {
-            "application": _entity_ref("spark_application", app_qn),
+            "process": _entity_ref("spark_process", process_qn),
             "inputs": [src_column_ref],
             "outputs": [dst_column_ref],
         },
-        "classifications": _classification_payload(
+        "classifications": _gov_classification(
             job_cd=job_cd,
             job_id=job_id,
             sql_query=sql_query,
@@ -802,167 +691,27 @@ def _build_column_spark_process_entity(
         ),
     }
 
+# ============================================================
+# Main processing
+# ============================================================
 
 def _chunked(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
 
-def _bulk_upsert(atlas_url: str, entities: list[dict]) -> dict:
-    if not entities:
-        return {}
-    return _curl_atlas_json(atlas_url, "/api/atlas/v2/entity/bulk", "POST", {"entities": entities})
-
-
 def _set_checkpoint(value: int) -> None:
     Variable.set(ATLAS_LAST_GOV_ID_VAR, str(int(value)))
-
-
-# ============================================================
-# Main processing
-# ============================================================
-
-def _build_entities_for_batch(atlas_url: str, rows: list[dict], jobs: dict[int, dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Returns:
-      spark_application_entities,
-      table_spark_process_entities,
-      column_spark_process_entities
-    """
-    spark_apps = {}
-    table_process_groups = {}
-    column_processes = []
-
-    for row in rows:
-        governance_id = int(row["governance_id"])
-        job_id = row.get("job_id")
-        if job_id is None:
-            continue
-
-        job = jobs.get(int(job_id))
-        if not job:
-            logger.warning("Skipping governance_id=%s because job_id=%s not found in data_transfer_job", governance_id, job_id)
-            continue
-
-        job_cd = str(job.get("job_cd") or f"job_{job_id}")
-        sql_query = job.get("sql_query") or ""
-        src_conn = _normalize_connection_name(job.get("data_src_conn_cd"))
-        dst_conn = _normalize_connection_name(job.get("dest_conn_cd"))
-
-        src_schema = _normalize_schema(row.get("source_schema_name"), fallback="unknown_schema")
-        src_table = _normalize_table(row.get("source_table_name"), fallback="unknown_table")
-        src_column = _normalize_column(row.get("source_column_name") or row.get("source_column_name_desc"), fallback="unknown_column")
-
-        dst_schema = _normalize_schema(row.get("destination_schema_name"), fallback="unknown_schema")
-        dst_table = _normalize_table(row.get("destination_table_name"), fallback="unknown_table")
-        dst_column = _normalize_column(row.get("destination_column_name") or row.get("destination_column_name_desc"), fallback="unknown_column")
-
-        if not _is_hive_schema(dst_schema):
-            raise AirflowException(
-                f"Destination schema '{dst_schema}' is not medallion Hive (brz/slv/gld). "
-                f"Current native DAG expects Hive targets."
-            )
-
-        layer_from = _detect_layer(src_schema)
-        layer_to = _detect_layer(dst_schema)
-
-        # Reuse native existing source entities
-        src_table_ref, src_column_ref = _resolve_source_native_ref(
-            atlas_url=atlas_url,
-            src_conn=src_conn,
-            src_schema=src_schema,
-            src_table=src_table,
-            src_column=src_column,
-        )
-
-        # Reuse native existing target Hive entities
-        dst_table_ref, dst_column_ref = _resolve_target_hive_ref(
-            atlas_url=atlas_url,
-            dst_schema=dst_schema,
-            dst_table=dst_table,
-            dst_column=dst_column,
-        )
-
-        app_qn = _spark_app_qn(job_cd, int(job_id))
-        if app_qn not in spark_apps:
-            spark_apps[app_qn] = _build_spark_application_entity(
-                job_cd=job_cd,
-                job_id=int(job_id),
-                sql_query=sql_query,
-                src_conn=src_conn,
-                dst_conn=dst_conn,
-                layer_from=layer_from,
-                layer_to=layer_to,
-            )
-
-        table_key = (
-            int(job_id),
-            src_table_ref["typeName"],
-            src_table_ref["uniqueAttributes"]["qualifiedName"],
-            dst_table_ref["typeName"],
-            dst_table_ref["uniqueAttributes"]["qualifiedName"],
-        )
-
-        if table_key not in table_process_groups:
-            table_process_groups[table_key] = {
-                "job_cd": job_cd,
-                "job_id": int(job_id),
-                "sql_query": sql_query,
-                "src_conn": src_conn,
-                "dst_conn": dst_conn,
-                "src_table_ref": src_table_ref,
-                "dst_table_ref": dst_table_ref,
-                "layer_from": layer_from,
-                "layer_to": layer_to,
-                "governance_ids": [],
-            }
-
-        table_process_groups[table_key]["governance_ids"].append(governance_id)
-
-        column_processes.append(
-            _build_column_spark_process_entity(
-                job_cd=job_cd,
-                job_id=int(job_id),
-                governance_id=governance_id,
-                create_timestamp=str(row.get("create_timestamp") or ""),
-                sql_query=sql_query,
-                src_conn=src_conn,
-                dst_conn=dst_conn,
-                src_column_ref=src_column_ref,
-                dst_column_ref=dst_column_ref,
-                layer_from=layer_from,
-                layer_to=layer_to,
-            )
-        )
-
-    table_processes = []
-    for grp in table_process_groups.values():
-        table_processes.append(
-            _build_table_spark_process_entity(
-                job_cd=grp["job_cd"],
-                job_id=grp["job_id"],
-                sql_query=grp["sql_query"],
-                src_conn=grp["src_conn"],
-                dst_conn=grp["dst_conn"],
-                src_table_ref=grp["src_table_ref"],
-                dst_table_ref=grp["dst_table_ref"],
-                layer_from=grp["layer_from"],
-                layer_to=grp["layer_to"],
-                governance_min_id=min(grp["governance_ids"]),
-                governance_max_id=max(grp["governance_ids"]),
-            )
-        )
-
-    return list(spark_apps.values()), table_processes, column_processes
 
 
 def _process_batches(atlas_url: str, start_last_id: int) -> dict:
     _ensure_governance_classification(atlas_url)
 
     total_rows = 0
-    total_spark_apps = 0
-    total_table_processes = 0
-    total_column_processes = 0
+    total_apps = 0
+    total_processes = 0
+    total_column_lineage = 0
+    total_skipped = 0
     total_batches = 0
     current_last_id = start_last_id
 
@@ -977,43 +726,143 @@ def _process_batches(atlas_url: str, start_last_id: int) -> dict:
         job_ids = sorted({int(r["job_id"]) for r in rows if r.get("job_id") is not None})
         jobs = _fetch_job_metadata(job_ids)
 
-        spark_apps, table_processes, column_processes = _build_entities_for_batch(atlas_url, rows, jobs)
+        apps = {}
+        processes = []
+        column_lineages = []
 
-        logger.info(
-            "Batch rows=%s spark_apps=%s table_processes=%s column_processes=%s",
-            len(rows), len(spark_apps), len(table_processes), len(column_processes)
-        )
+        for row in rows:
+            try:
+                governance_id = int(row["governance_id"])
+                job_id = row.get("job_id")
+                if job_id is None:
+                    total_skipped += 1
+                    continue
 
-        # Create/update spark applications first
-        for chunk in _chunked(spark_apps, ATLAS_PUSH_CHUNK_SIZE):
+                job = jobs.get(int(job_id))
+                if not job:
+                    total_skipped += 1
+                    continue
+
+                job_cd = str(job.get("job_cd") or f"job_{job_id}")
+                sql_query = job.get("sql_query") or ""
+                src_conn = _normalize_conn(job.get("data_src_conn_cd"))
+                dst_conn = _normalize_conn(job.get("dest_conn_cd"))
+
+                src_schema = row.get("source_schema_name")
+                src_table = row.get("source_table_name")
+                src_column = row.get("source_column_name") or row.get("source_column_name_desc")
+
+                dst_schema = row.get("destination_schema_name")
+                dst_table = row.get("destination_table_name")
+                dst_column = row.get("destination_column_name") or row.get("destination_column_name_desc")
+
+                src_table_ref, src_column_ref = _resolve_source_ref(
+                    atlas_url=atlas_url,
+                    src_conn=src_conn,
+                    src_schema=src_schema,
+                    src_table=src_table,
+                    src_column=src_column,
+                )
+
+                dst_table_ref, dst_column_ref = _resolve_target_hive_ref(
+                    atlas_url=atlas_url,
+                    dst_schema=dst_schema,
+                    dst_table=dst_table,
+                    dst_column=dst_column,
+                )
+
+                if not src_table_ref or not src_column_ref or not dst_table_ref or not dst_column_ref:
+                    total_skipped += 1
+                    logger.warning("Skipped governance_id=%s because source/target entity could not be resolved", governance_id)
+                    continue
+
+                layer_from = _detect_layer(_source_defaults_from_conn(src_conn, src_schema, src_table, src_column)[0])
+                layer_to = _detect_layer(_normalize_dest_schema(dst_schema))
+
+                app_qn = _spark_app_qn(job_cd, int(job_id))
+                if app_qn not in apps:
+                    apps[app_qn] = _build_spark_application(
+                        job_cd=job_cd,
+                        job_id=int(job_id),
+                        sql_query=sql_query,
+                        src_conn=src_conn,
+                        dst_conn=dst_conn,
+                        layer_from=layer_from,
+                        layer_to=layer_to,
+                    )
+
+                proc_qn = _spark_proc_qn(job_cd, governance_id)
+
+                processes.append(
+                    _build_spark_process(
+                        job_cd=job_cd,
+                        job_id=int(job_id),
+                        governance_id=governance_id,
+                        sql_query=sql_query,
+                        src_conn=src_conn,
+                        dst_conn=dst_conn,
+                        src_table_ref=src_table_ref,
+                        dst_table_ref=dst_table_ref,
+                        layer_from=layer_from,
+                        layer_to=layer_to,
+                    )
+                )
+
+                column_lineages.append(
+                    _build_spark_column_lineage(
+                        job_cd=job_cd,
+                        job_id=int(job_id),
+                        governance_id=governance_id,
+                        create_timestamp=str(row.get("create_timestamp") or ""),
+                        sql_query=sql_query,
+                        src_conn=src_conn,
+                        dst_conn=dst_conn,
+                        src_column_ref=src_column_ref,
+                        dst_column_ref=dst_column_ref,
+                        process_qn=proc_qn,
+                        layer_from=layer_from,
+                        layer_to=layer_to,
+                    )
+                )
+
+            except Exception as exc:
+                total_skipped += 1
+                logger.warning(
+                    "Skipped governance row: governance_id=%s error=%s",
+                    row.get("governance_id"),
+                    str(exc),
+                )
+                continue
+
+        apps_list = list(apps.values())
+
+        for chunk in _chunked(apps_list, ATLAS_PUSH_CHUNK_SIZE):
             _bulk_upsert(atlas_url, chunk)
 
-        # Table-level lineage
-        for chunk in _chunked(table_processes, ATLAS_PUSH_CHUNK_SIZE):
+        for chunk in _chunked(processes, ATLAS_PUSH_CHUNK_SIZE):
             _bulk_upsert(atlas_url, chunk)
 
-        # Column-level lineage
-        for chunk in _chunked(column_processes, ATLAS_PUSH_CHUNK_SIZE):
+        for chunk in _chunked(column_lineages, ATLAS_PUSH_CHUNK_SIZE):
             _bulk_upsert(atlas_url, chunk)
 
         batch_max_id = max(int(r["governance_id"]) for r in rows)
         _set_checkpoint(batch_max_id)
         current_last_id = batch_max_id
 
-        total_spark_apps += len(spark_apps)
-        total_table_processes += len(table_processes)
-        total_column_processes += len(column_processes)
+        total_apps += len(apps_list)
+        total_processes += len(processes)
+        total_column_lineage += len(column_lineages)
 
     return {
         "start_last_governance_id": start_last_id,
         "end_last_governance_id": current_last_id,
         "total_rows": total_rows,
-        "total_spark_apps": total_spark_apps,
-        "total_table_processes": total_table_processes,
-        "total_column_processes": total_column_processes,
+        "total_apps": total_apps,
+        "total_processes": total_processes,
+        "total_column_lineage": total_column_lineage,
+        "total_skipped": total_skipped,
         "total_batches": total_batches,
     }
-
 
 # ============================================================
 # DAG
@@ -1029,19 +878,17 @@ default_args = {
 with DAG(
     dag_id=DAG_ID,
     default_args=default_args,
-    description="Native Atlas Spark lineage from PostgreSQL governance tables",
+    description="Simple native Atlas Spark lineage from PostgreSQL governance",
     start_date=datetime(2026, 1, 1),
-    schedule_interval=None,   # Run manually first. Add cron later.
+    schedule_interval=None,  # run manually first
     catchup=False,
     max_active_runs=1,
-    tags=["atlas", "spark", "lineage", "native", "governance"],
+    tags=["atlas", "spark", "native", "simple", "governance"],
 ) as dag:
 
     @task
     def validate_runtime_config() -> dict:
-        cfg = _runtime_config()
-        logger.info("Runtime config validated. atlas_url=%s last_governance_id=%s", cfg["atlas_url"], cfg["last_governance_id"])
-        return cfg
+        return _runtime_config()
 
     @task
     def kinit_and_test(cfg: dict) -> dict:
@@ -1055,14 +902,15 @@ with DAG(
 
     @task
     def emit_summary(summary: dict) -> None:
-        logger.info("=== FINAL NATIVE SPARK LINEAGE SUMMARY ===")
-        logger.info("Start checkpoint      : %s", summary["start_last_governance_id"])
-        logger.info("End checkpoint        : %s", summary["end_last_governance_id"])
-        logger.info("Total rows            : %s", summary["total_rows"])
-        logger.info("Spark applications    : %s", summary["total_spark_apps"])
-        logger.info("Table spark processes : %s", summary["total_table_processes"])
-        logger.info("Column spark processes: %s", summary["total_column_processes"])
-        logger.info("Batches               : %s", summary["total_batches"])
+        logger.info("=== SUMMARY ===")
+        logger.info("Start checkpoint  : %s", summary["start_last_governance_id"])
+        logger.info("End checkpoint    : %s", summary["end_last_governance_id"])
+        logger.info("Total rows        : %s", summary["total_rows"])
+        logger.info("Spark applications: %s", summary["total_apps"])
+        logger.info("Spark processes   : %s", summary["total_processes"])
+        logger.info("Column lineage    : %s", summary["total_column_lineage"])
+        logger.info("Skipped rows      : %s", summary["total_skipped"])
+        logger.info("Batches           : %s", summary["total_batches"])
 
     cfg = validate_runtime_config()
     cfg2 = kinit_and_test(cfg)
@@ -1072,113 +920,45 @@ with DAG(
 
 ---
 
-# 7. What you must edit before first run
+## Why this is the right native design
 
-Only this section:
-
-```python
-SOURCE_SYSTEM_MAP = {
-    ...
-}
-```
-
-For each non-Hive source connection, put the **real native Atlas type** and **real native Atlas QN pattern** already present in your Atlas.
-
-Do not guess.
-
-For example, if `mostaql` tables already exist in Atlas as `rdbms_table` with QN like:
-
-```text
-dbo.customer@cm
-```
-
-then keep:
-
-```python
-"mostaql": {
-    "table_type": "rdbms_table",
-    "column_type": "rdbms_column",
-    "table_qn_template": "{schema}.{table}@cm",
-    "column_qn_template": "{schema}.{table}.{column}@cm",
-}
-```
-
-If the real QN pattern is different, change it to the real one.
+Cloudera documents that Atlas models a Spark job as a **`spark_application`** and the executed units as **`spark_process`** entities connected by **inputs**, **outputs**, and **application** relationships. It also documents a native **`spark_column_lineage`** entity with input columns, output column, and relationship to the producing process. Atlas lineage graphs are built from those relationships. ([Cloudera Docs][1])
 
 ---
 
-# 8. Deployment steps
+## Notes
 
-## Step 1
-
-Pause old DAGs.
-
-## Step 2
-
-Put the new DAG file in Airflow DAGs folder.
-
-## Step 3
-
-Set:
-
-```text
-gca_atlas_last_governance_id = 0
-```
-
-for a full reload.
-
-## Step 4
-
-Run this DAG manually first.
-
-## Step 5
-
-Check logs for any source mapping failure.
-If a source system is not mapped correctly, the DAG will stop with a clear error.
-
-## Step 6
-
-Validate in Atlas:
-
-* Spark application created
-* spark_process created
-* Hive target lineage visible
-* column-level lineage visible
-* classification `data_like_governance_meta` visible on the spark entities
-
-## Step 7
-
-After successful validation, add a schedule.
-For example:
+The only place you may need one tiny adjustment is this line inside `_build_spark_column_lineage`:
 
 ```python
-schedule_interval="*/15 * * * *"
+"process": _entity_ref("spark_process", process_qn),
 ```
 
----
-
-# 9. What this final design gives you
-
-You asked for native and professional. This design gives you:
-
-* native **Hive DB / table / column**
-* native **spark_application**
-* native **spark_process**
-* real **table-level Spark lineage**
-* real **column-level Spark lineage**
-* governance/business metadata preserved through **classification**
-* no fake datalike entities
-* no duplicate Hive assets
-* PostgreSQL used only as the governance metadata source
+If your cluster uses a different relationship attribute name for `spark_column_lineage`, change only `"process"` to the exact name shown by one existing `spark_column_lineage` entity in your Atlas.
 
 ---
 
-# 10. Important operational note
+## Steps to run
 
-This DAG **reuses existing native source assets**.
+1. Put the file in Airflow DAGs folder.
+2. Set:
 
-So for every non-Hive source connection, Atlas must already have those source entities onboarded natively, and your `SOURCE_SYSTEM_MAP` must match their actual QN pattern.
+   ```text
+   gca_atlas_last_governance_id = 0
+   ```
+3. Run manually.
+4. Validate:
 
-That is the correct enterprise behavior.
+   * one `spark_application` per job
+   * many `spark_process` under that job
+   * target Hive tables and columns are connected
+   * column lineage appears from source to target
+5. Then add a schedule, for example:
 
-If you want, the next message can be a **source mapping worksheet** where I help you build the exact `SOURCE_SYSTEM_MAP` entries for each of your source connections one by one.
+   ```python
+   schedule_interval="*/15 * * * *"
+   ```
+
+If you want, I can give you one very short **Postgres query set** to test 5 sample rows before you run the full load.
+
+[1]: https://docs.cloudera.com/runtime/7.3.1/atlas-reference/topics/atlas-spark-lineage.html?utm_source=chatgpt.com "Spark lineage | Cloudera on Cloud"
