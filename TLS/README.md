@@ -314,3 +314,22 @@ Typical files per host:
 > ⚠️ Never leave the key password file on shared systems. Rotate/secure it per your policy.
 
 ---
+## 10) Add new Server Certificate
+``` bash
+curl -k -u admin:admin \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json' \
+  -d '{
+    "location": "/opt/cloudera/AutoTLS",
+    "interpretAsFilenames": true,
+    "hostCerts": [
+      {
+        "hostname": "worker4.my.bigdata.local",
+        "certificate": "/tmp/auto-tls/certs/worker4.my.bigdata.local.cer",
+        "key": "/tmp/auto-tls/keys/worker4.my.bigdata.local.key"
+      }
+    ]
+  }' \
+  'https://utility1.my.bigdata.local:7183/api/v45/cm/commands/addCustomCerts'
+```
